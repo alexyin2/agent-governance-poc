@@ -1,0 +1,24 @@
+# Python
+.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Env & secrets
+.env
+
+# Generated outputs
+outputs/
+
+# OS
+.DS_Store
+
+# AgentCore deploy config (has absolute local paths — run `agentcore configure` on each machine)
+.bedrock_agentcore.yaml
+.bedrock_agentcore/
+
+# Claude Code local settings
+.claude/
+
+# Sample documents (contain internal data — copy manually to each machine)
+samples/

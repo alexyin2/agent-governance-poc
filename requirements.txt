@@ -1,0 +1,8 @@
+strands-agents
+bedrock-agentcore
+bedrock-agentcore-starter-toolkit
+boto3>=1.35
+PyMuPDF
+openpyxl
+tavily-python
+python-dotenv
