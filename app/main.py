@@ -90,13 +90,13 @@ def search_knowledge_base(query: str) -> str:
 
 
 @tool
-def web_search(query: str) -> str:
+async def web_search(query: str) -> str:
     """Search the public web (Tavily) for up-to-date information not in the KB.
 
     Args:
         query: A natural-language web search query.
     """
-    return json.dumps(_web(query))
+    return json.dumps(await _web(query))
 
 
 @tool

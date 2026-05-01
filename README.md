@@ -87,11 +87,41 @@ python scripts/invoke_local.py samples/input_sample.pdf
 看 `outputs/` 是否有 `*_revised.pdf`。
 
 ### 6. 部署到 AgentCore Runtime
+
+雲端不能讀本地 `.env`（已在 `.dockerignore`）。機密與設定分兩條路注入：
+
+**6a. 機密 → AgentCore Identity（一次性）**
+
+`TAVILY_API_KEY` 存進 AgentCore Identity 的 API Key Credential Provider，agent 內由 `@requires_api_key` 在 cold start 取出。底層仍是 Secrets Manager，但走 agent-aware 介面（cross-agent 隔離、審計）。
+
 ```bash
-agentcore deploy
+./scripts/setup-identity.sh        # 互動輸入 Tavily key，建 tavily-provider
+```
+
+Runtime execution role 需要：
+```
+bedrock-agentcore:GetWorkloadAccessToken
+bedrock-agentcore:GetResourceApiKey
+```
+（`agentcore configure --auto-create-role` 會自動帶；手動 role 要自己加。）
+
+**6b. 非機密設定 → `agentcore launch --env`**
+
+```bash
+agentcore configure                # 首次：選 Strands、Bedrock、defaults
+agentcore launch \
+  --env BEDROCK_MODEL_ID=us.anthropic.claude-opus-4-7-20250101-v1:0 \
+  --env KB_ID=XXXXXXXXXX \
+  --env S3_BUCKET=<your-bucket> \
+  --env OUTPUT_DIR=outputs
+# AWS_REGION 由 Runtime 自動注入
+
 agentcore invoke '{"file_uri":"s3://<bucket>/input.pdf","file_type":"pdf"}'
 ```
+
 CloudWatch logs 應顯示工具呼叫鏈。
+
+> 本地開發仍用 `.env` — `tools/web_search.py` 先讀 `TAVILY_API_KEY` env var，找不到才走 AgentCore Identity，所以本地不會打到雲端 API。
 
 ## 專案結構
 - `app/main.py` — Strands agent + `@app.entrypoint`
