@@ -28,6 +28,7 @@ from model.load import load_model
 from tools.file_reader import read_input_file as _read
 from tools.file_writer import write_revised_file as _write
 from tools.kb_search import search_knowledge_base as _kb
+from tools.web_search import prewarm_key as _prewarm_tavily_key
 from tools.web_search import web_search as _web
 
 load_dotenv()
@@ -226,6 +227,13 @@ async def invoke(payload, context=None):
         return
 
     yield _ev("start", file_uri=file_uri, file_type=file_type, task=task)
+
+    # Cold-start prewarm: pull Tavily key from env (local) or AgentCore Identity (cloud).
+    # Done here (not at module import) so the runtime workload context is available.
+    try:
+        await _prewarm_tavily_key()
+    except Exception as e:
+        log.warning(f"Tavily key prewarm failed (web_search will error if used): {e}")
 
     seen_tools: set[str] = set()
     final_text_parts: list[str] = []
