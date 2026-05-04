@@ -90,9 +90,9 @@ python scripts/invoke_local.py samples/input_sample.pdf
 
 雲端不能讀本地 `.env`（已在 `.dockerignore`）。機密與設定分兩條路注入：
 
-**6a. 機密 → AgentCore Identity（一次性）**
+**6a. 機密 → AgentCore Identity（理想做法，但目前被 SCP 擋）**
 
-`TAVILY_API_KEY` 存進 AgentCore Identity 的 API Key Credential Provider，agent 內由 `@requires_api_key` 在 cold start 取出。底層仍是 Secrets Manager，但走 agent-aware 介面（cross-agent 隔離、審計）。
+正式做法是把 `TAVILY_API_KEY` 存進 AgentCore Identity 的 API Key Credential Provider，agent 內由 `@requires_api_key` 在 cold start 取出。底層仍是 Secrets Manager，但走 agent-aware 介面（cross-agent 隔離、審計）。
 
 ```bash
 ./scripts/setup-identity.sh        # 互動輸入 Tavily key，建 tavily-provider
@@ -105,18 +105,55 @@ bedrock-agentcore:GetResourceApiKey
 ```
 （`agentcore configure --auto-create-role` 會自動帶；手動 role 要自己加。）
 
+> ⚠️ **目前障礙**：本專案 AWS 帳號的組織 SCP 拒絕 `bedrock-agentcore:CreateApiKeyCredentialProvider`，無論 region。`./scripts/setup-identity.sh` 會跑出 `AccessDeniedException ... explicit deny in a service control policy`。
+>
+> **長期解**：請組織 admin 用具備該權限的身份代為執行：
+> ```bash
+> aws bedrock-agentcore-control create-api-key-credential-provider \
+>   --name tavily-provider \
+>   --api-key <Tavily key> \
+>   --region us-west-2
+> ```
+> Provider 建好後，本帳號 IAM user 只需要 `bedrock-agentcore:GetResourceApiKey` 讀取權限（execution role 已帶）就能用。
+>
+> **短期解**（目前 PoC 採用）：把 Tavily key 改用 `--env` 注入，繞過 Identity。見 6b。
+
 **6b. 非機密設定 → `agentcore launch --env`**
 
+當前 PoC 使用的指令（含 6a 的 fallback：`TAVILY_API_KEY` 也走 `--env`）：
+
 ```bash
-agentcore configure                # 首次：選 Strands、Bedrock、defaults
+# 把 .env 的值灌進當前 shell 變數（一次性）
+set -a; source .env; set +a
+
+agentcore configure --entrypoint app/main.py --auto-create-role --region us-west-2  # 首次
 agentcore launch \
-  --env BEDROCK_MODEL_ID=us.anthropic.claude-opus-4-7-20250101-v1:0 \
-  --env KB_ID=XXXXXXXXXX \
-  --env S3_BUCKET=<your-bucket> \
-  --env OUTPUT_DIR=outputs
+  --env BEDROCK_MODEL_ID="$BEDROCK_MODEL_ID" \
+  --env KB_ID="$KB_ID" \
+  --env S3_BUCKET="$S3_BUCKET" \
+  --env TAVILY_API_KEY="$TAVILY_API_KEY"     # ← Identity 通了之後拿掉這行
 # AWS_REGION 由 Runtime 自動注入
 
-agentcore invoke '{"file_uri":"s3://<bucket>/input.pdf","file_type":"pdf"}'
+agentcore invoke '{"file_uri":"s3://<bucket>/inputs/input.pdf","file_type":"pdf"}'
+```
+
+> Identity 通了之後切回正規路徑：刪掉 `--env TAVILY_API_KEY`，code 不用改 — `tools/web_search.py` 的 `prewarm_key()` 邏輯是「env var 優先 → 沒有才打 Identity」，env 被清掉就會自然走 Identity。
+
+Runtime execution role 需要的 IAM policy（除了 `agentcore configure --auto-create-role` 預設帶的之外，還要手動加 inline policy）：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid":"ReadInputs","Effect":"Allow","Action":"s3:GetObject",
+     "Resource":"arn:aws:s3:::<your-bucket>/inputs/*"},
+    {"Sid":"WriteOutputs","Effect":"Allow","Action":"s3:PutObject",
+     "Resource":"arn:aws:s3:::<your-bucket>/outputs/*"},
+    {"Sid":"RetrieveKB","Effect":"Allow",
+     "Action":["bedrock:Retrieve","bedrock:RetrieveAndGenerate"],
+     "Resource":"arn:aws:bedrock:us-west-2:<account>:knowledge-base/<KB_ID>"}
+  ]
+}
 ```
 
 CloudWatch logs 應顯示工具呼叫鏈。
@@ -131,14 +168,14 @@ CloudWatch logs 應顯示工具呼叫鏈。
 ```
 s3://$S3_BUCKET/
 ├── inputs/<filename>.{pdf,xlsx}        ← 呼叫端先 putObject 到這裡
-└── outputs/<filename>_revised.{pdf,xlsx}  ← agent 寫回此處，URI 放在 result.revised_file_uri
+└── outputs/<filename>_revised_<UTC-timestamp>.{pdf,xlsx}  ← agent 寫回此處，URI 放在 result.revised_file_uri
 ```
 
 呼叫範例：
 ```bash
 aws s3 cp samples/input_sample.pdf s3://$S3_BUCKET/inputs/
 agentcore invoke '{"file_uri":"s3://'$S3_BUCKET'/inputs/input_sample.pdf","file_type":"pdf"}'
-# result.revised_file_uri => s3://$S3_BUCKET/outputs/input_sample_revised.pdf
+# result.revised_file_uri => s3://$S3_BUCKET/outputs/input_sample_revised_20260504T044812Z.pdf
 ```
 
 本地開發 `S3_BUCKET` 留空即可 — `tools/file_writer.py` 的 `_maybe_upload` 偵測沒設就只寫 `outputs/` 本地目錄。
