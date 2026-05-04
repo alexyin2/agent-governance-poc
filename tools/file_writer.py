@@ -78,6 +78,18 @@ def write_revised_pdf(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
     return _maybe_upload(out)
 
 
+def _comment_size(text: str) -> tuple[int, int]:
+    """Pick a comment box big enough for the text (Excel default 100x150 px is too small).
+
+    Heuristic: ~24 CJK chars per line, ~18px line height. Min 400x200, max 600x600.
+    """
+    line_chars = 24
+    lines = max(1, sum(max(1, -(-len(part) // line_chars)) for part in text.split("\n")))
+    width = 480
+    height = max(200, min(600, 40 + lines * 22))
+    return width, height
+
+
 def write_revised_xlsx(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
     """Attach a comment per suggestion. Each needs {sheet: str, cell: str (e.g. 'A1'), text: str}."""
     local = _ensure_local(file_uri)
@@ -88,7 +100,9 @@ def write_revised_xlsx(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
         body = s.get("text", "")
         if not cell or sheet not in wb.sheetnames:
             continue
-        wb[sheet][cell].comment = Comment(body, "AgentReviewer")
+        comment = Comment(body, "AgentReviewer")
+        comment.width, comment.height = _comment_size(body)
+        wb[sheet][cell].comment = comment
     out = _output_path(local)
     wb.save(out)
     return _maybe_upload(out)
