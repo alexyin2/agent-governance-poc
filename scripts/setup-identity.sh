@@ -6,7 +6,7 @@
 set -euo pipefail
 
 PROFILE="${AWS_PROFILE:-agentcore-poc}"
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 PROVIDER_NAME="tavily-provider"
 
 read -r -s -p "Tavily API key: " TAVILY_KEY
