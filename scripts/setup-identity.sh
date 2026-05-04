@@ -2,7 +2,12 @@
 # Create / update an AgentCore Identity API Key Credential Provider for Tavily.
 # Usage:
 #   ./scripts/setup-identity.sh
-# Reads AWS_PROFILE / AWS_REGION from env (defaults: agentcore-poc / us-east-1).
+# Reads AWS_PROFILE / AWS_REGION from env (defaults: agentcore-poc / us-west-2).
+#
+# NOTE: this script may fail with AccessDeniedException if your org SCP blocks
+# bedrock-agentcore:CreateApiKeyCredentialProvider (as ours does). When that
+# happens, create the provider via the AWS Console UI instead — see README §6a.
+# Provider name must be "tavily-provider" to match tools/web_search.py.
 set -euo pipefail
 
 PROFILE="${AWS_PROFILE:-agentcore-poc}"
