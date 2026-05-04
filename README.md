@@ -127,7 +127,19 @@ agentcore launch \
 # AWS_REGION 由 Runtime 自動注入；TAVILY_API_KEY 走 Identity 不傳
 
 agentcore invoke '{"file_uri":"s3://<bucket>/inputs/input.pdf","file_type":"pdf"}'
+
+# 多檔同時審查（cross-file 一致性檢查）：
+agentcore invoke '{
+  "files": [
+    {"uri":"s3://<bucket>/inputs/cab.pdf",          "type":"pdf"},
+    {"uri":"s3://<bucket>/inputs/risk_assessment.xlsx","type":"xlsx"}
+  ]
+}'
 ```
+
+Payload 兩種寫法都支援（向後相容）：
+- 舊單檔：`{"file_uri":..., "file_type":...}`
+- 新多檔：`{"files":[{"uri":..., "type":...}, ...]}` — agent 會跨檔交叉驗證，result 會多一個 `cross_findings` 欄位
 
 > 萬一 Console 建 provider 也被擋（公司未來改 SCP 範圍可能）：暫時加 `--env TAVILY_API_KEY="$TAVILY_API_KEY"` 走 env-var 後備路徑。`prewarm_key()` 邏輯是「env var 優先 → 沒有才打 Identity」，env 被清掉就會自然走 Identity，code 不用改。
 
