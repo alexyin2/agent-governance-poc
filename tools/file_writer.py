@@ -24,9 +24,15 @@ def _ensure_local(file_uri: str) -> str:
 
 
 def _output_path(src: str) -> str:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     base = os.path.basename(src)
     name, ext = os.path.splitext(base)
+    # Cloud path (S3_BUCKET set): write to tempdir; container cwd is often read-only.
+    # _maybe_upload() will pick the file up and PutObject to s3://bucket/outputs/.
+    if os.getenv("S3_BUCKET"):
+        tmp_dir = tempfile.mkdtemp(prefix="agent-poc-out-")
+        return os.path.join(tmp_dir, f"{name}_revised{ext}")
+    # Local dev path: write under repo's outputs/ for easy inspection.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     return os.path.join(OUTPUT_DIR, f"{name}_revised{ext}")
 
 
