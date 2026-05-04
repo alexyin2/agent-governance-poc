@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import boto3
@@ -10,6 +11,11 @@ from openpyxl import load_workbook
 from openpyxl.comments import Comment
 
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
+
+
+def _timestamp() -> str:
+    """UTC timestamp suitable for file names: YYYYMMDDTHHMMSSZ."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _ensure_local(file_uri: str) -> str:
@@ -26,14 +32,17 @@ def _ensure_local(file_uri: str) -> str:
 def _output_path(src: str) -> str:
     base = os.path.basename(src)
     name, ext = os.path.splitext(base)
+    # Timestamp prevents repeat invocations from clobbering each other in
+    # outputs/ (or in S3, where overwrites are silent).
+    out_name = f"{name}_revised_{_timestamp()}{ext}"
     # Cloud path (S3_BUCKET set): write to tempdir; container cwd is often read-only.
     # _maybe_upload() will pick the file up and PutObject to s3://bucket/outputs/.
     if os.getenv("S3_BUCKET"):
         tmp_dir = tempfile.mkdtemp(prefix="agent-poc-out-")
-        return os.path.join(tmp_dir, f"{name}_revised{ext}")
+        return os.path.join(tmp_dir, out_name)
     # Local dev path: write under repo's outputs/ for easy inspection.
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return os.path.join(OUTPUT_DIR, f"{name}_revised{ext}")
+    return os.path.join(OUTPUT_DIR, out_name)
 
 
 def _maybe_upload(local: str) -> str:
