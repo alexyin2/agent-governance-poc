@@ -122,6 +122,28 @@ agentcore invoke '{"file_uri":"s3://<bucket>/input.pdf","file_type":"pdf"}'
 CloudWatch logs 應顯示工具呼叫鏈。
 
 > 本地開發仍用 `.env` — `tools/web_search.py` 先讀 `TAVILY_API_KEY` env var，找不到才走 AgentCore Identity，所以本地不會打到雲端 API。
+> Cold start 時 [`app/main.py`](app/main.py) 的 `invoke()` 會 await 一次 `prewarm_key()`，把 key 灌進 `tools/web_search.py` 的 module cache，後續 sync `web_search` tool 直接讀取。
+
+## S3 Layout
+
+雲端部署時固定用 **單一 bucket + 兩個 prefix**：
+
+```
+s3://$S3_BUCKET/
+├── inputs/<filename>.{pdf,xlsx}        ← 呼叫端先 putObject 到這裡
+└── outputs/<filename>_revised.{pdf,xlsx}  ← agent 寫回此處，URI 放在 result.revised_file_uri
+```
+
+呼叫範例：
+```bash
+aws s3 cp samples/input_sample.pdf s3://$S3_BUCKET/inputs/
+agentcore invoke '{"file_uri":"s3://'$S3_BUCKET'/inputs/input_sample.pdf","file_type":"pdf"}'
+# result.revised_file_uri => s3://$S3_BUCKET/outputs/input_sample_revised.pdf
+```
+
+本地開發 `S3_BUCKET` 留空即可 — `tools/file_writer.py` 的 `_maybe_upload` 偵測沒設就只寫 `outputs/` 本地目錄。
+
+> PoC 階段直接回傳 `s3://` URI，假設呼叫端有讀 bucket 的權限。若未來 client 沒有 AWS 身份，再改成回 presigned URL。
 
 ## 專案結構
 - `app/main.py` — Strands agent + `@app.entrypoint`

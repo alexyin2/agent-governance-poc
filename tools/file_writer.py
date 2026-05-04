@@ -34,7 +34,7 @@ def _maybe_upload(local: str) -> str:
     bucket = os.getenv("S3_BUCKET")
     if not bucket:
         return local
-    key = f"agent-poc/outputs/{os.path.basename(local)}"
+    key = f"outputs/{os.path.basename(local)}"
     boto3.client("s3").upload_file(local, bucket, key)
     return f"s3://{bucket}/{key}"
 
