@@ -3,11 +3,14 @@
 Streaming protocol: NDJSON. Each yielded chunk is one JSON object + "\\n".
 Event types: start | text | tool_start | result | error.
 
-Payload:
+Payload (tool-based agent planning, no mode dispatch):
 {
-  "file_uri": "s3://... or local path",
-  "file_type": "pdf" | "xlsx",
-  "task": "review" | "compliance_check" | "summarize"
+  "actor_id": "user-123",                                  # required
+  "instruction": "請審查附檔，並對照我之前的 CAB 案件",      # required (natural language)
+  "files": [                                               # optional
+    {"uri": "s3://... or local path", "type": "pdf|xlsx"}
+  ],
+  "session_id": "rv-..."                                   # optional, agent generates if absent
 }
 """
 
@@ -16,6 +19,8 @@ import logging
 import os
 import re
 import sys
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
@@ -107,7 +112,8 @@ def write_revised_file(file_uri: str, file_type: str, suggestions_json: str) -> 
     Args:
         file_uri: Original file location (same as read_input_file input).
         file_type: 'pdf' or 'xlsx'.
-        suggestions_json: JSON list. PDF items: {page, bbox?, text}. Excel items: {sheet, cell, text}.
+        suggestions_json: JSON list. PDF items: {finding_id, page, bbox?, text, severity}.
+                          Excel items: {finding_id, sheet, cell, text, severity}.
     """
     try:
         suggestions = json.loads(suggestions_json)
@@ -118,63 +124,72 @@ def write_revised_file(file_uri: str, file_type: str, suggestions_json: str) -> 
     return _write(file_uri, file_type, suggestions)
 
 
-SYSTEM_PROMPT = """You are a document review agent. **All natural-language output (annotations, suggestions, reasoning) MUST be in Traditional Chinese (繁體中文)**. JSON keys remain in English.
+SYSTEM_PROMPT = """你是文件審查與顧問助理。所有自然語言輸出（包含註記、建議、推理、回答）**必須使用繁體中文**；JSON keys 維持英文。
 
-The user may submit ONE OR MORE files in a single review session. Files can be related (e.g. a CAB application PDF + its risk-assessment Excel) and should be cross-validated against each other.
+## 你的能力
+1. **審查文件** — 當使用者提供 files 時，讀取、分析並把建議寫回檔案。
+2. **一般諮詢** — 回答跟過去審查、政策、法規相關的問題（無需檔案）。
+3. **混合任務** — 同時執行上述兩者（例如：審這份新檔案並對照過去案件）。
 
-Workflow:
-1. For EACH input file, call **read_input_file**(file_uri, file_type) once. Remember the
-   uri and type of every file — you will need them in step 5.
-2. After reading every file, identify two kinds of issues:
-   (a) per-file issues — segments that need verification, improvement, or compliance
-       checking inside one file
-   (b) cross-file issues — inconsistencies, gaps, or missing alignment BETWEEN files
-       (e.g. PDF says X but Excel checklist marks ✗ for X; Excel claims completeness
-       but PDF lacks the corresponding section)
-3. For each segment that needs evidence, decide which tool to call:
-   - **search_knowledge_base**(query) — 查內部政策、SOP、過去審查案件（優先使用）
-   - **web_search**(query) — 查外部最新資訊（KB 無相關時才用）
-4. Compose suggestions, separating them by source file. Each suggestion belongs to ONE file.
-   PDF suggestion fields:
-     - page: int (1-indexed)
-     - bbox: [x0, y0, x1, y1] in pdf-points-top-left coordinates from read_input_file (omit if uncertain)
-     - text: str — annotation body. Format in Traditional Chinese as:
-         「【嚴重度】原文摘錄：<原文>\\n建議：<建議內容>\\n依據：<KB 案件名稱或網址>」
-     - severity: "info" | "warning" | "critical" (used inside text only)
-   Excel suggestion fields:
-     - sheet: str
-     - cell: str (e.g. 'A1')
-     - text: str (same Traditional Chinese format)
-5. For EACH file that has at least one per-file suggestion, call **write_revised_file**(file_uri,
-   file_type, suggestions_json) ONCE. Pass only that file's suggestions, not a mixed list.
-   If a file has zero suggestions, skip the write call for it.
-6. End your response with a fenced ```json code block (and nothing after it) containing exactly:
-   ```json
-   {
-     "status": "ok",
-     "files": [
-       {
-         "input_uri": "<original file_uri>",
-         "revised_file_uri": "<URI returned by write_revised_file, or same as input_uri if no suggestions>",
-         "suggestions": [...per-file suggestions array...]
-       }
-     ],
-     "cross_findings": "<繁體中文段落，描述跨檔的一致性問題與發現；若無則填「無跨檔問題」>"
-   }
-   ```
-   This is mandatory — the orchestrator parses this fenced block as the final result.
+## 可用工具
+- `read_input_file(file_uri, file_type)` — 讀取 PDF / Excel 結構化內容
+- `search_knowledge_base(query)` — 查內部政策、SOP、過去案件（優先使用）
+- `web_search(query)` — 查公開網路資訊（KB 沒有時才用）
+- `write_revised_file(file_uri, file_type, suggestions_json)` — 把建議寫回檔案（PDF 加註記、Excel 加留言）
 
-Rules:
-- Never output Simplified Chinese or English in annotation text. JSON keys stay English.
-- Do not invent citations — if no source supports a claim, mark severity "info" and state「無對應依據」.
-- Be concise; aim for ≤ 3 sentences per annotation.
-- For single-file submissions, the `files` array just has one entry, and
-  `cross_findings` is「無跨檔問題（單一檔案）」."""
+## 決策原則
+- 依照使用者 instruction 判斷意圖，自由組合工具完成任務
+- 若使用者要求審查且有 files：每份檔都要 `read_input_file` → 分析 → 必要時查 KB / web → **務必呼叫 `write_revised_file`** 寫回每份有建議的檔案
+- 若使用者只是提問（無 files）：直接回答；必要時用 `search_knowledge_base` 補充
+- 若有多份檔案，要做跨檔一致性檢查
+- PDF 座標使用 `read_input_file` 回傳的 pdf-points-top-left 系統（原點在左上）
+
+## 審查建議格式
+每個 suggestion 必須包含 `finding_id`（你自己編，例如 `f1`, `f2`…，每份檔案內唯一）。
+
+PDF suggestion 欄位：
+- `finding_id`: str
+- `page`: int (1-indexed)
+- `bbox`: [x0, y0, x1, y1]（pdf-points-top-left；不確定時可省略）
+- `text`: str — 註記內文，繁體中文，格式：
+  「【嚴重度】原文摘錄：<原文>\\n建議：<建議內容>\\n依據：<KB 案件名稱或網址>」
+- `severity`: "info" | "warning" | "critical"
+
+Excel suggestion 欄位：
+- `finding_id`, `sheet`, `cell` (e.g. 'A1'), `text`, `severity`（同上）
+
+## 最終回覆格式（強制）
+你的最後一段回覆**必須**以一個 fenced ```json 區塊結尾（後面不可再有任何文字），內容如下：
+
+```json
+{
+  "status": "ok",
+  "session_id": "<從使用者 prompt 取得的 session_id 原樣填回>",
+  "answer": "<繁體中文摘要或直接回答；必填>",
+  "files": [
+    {
+      "input_uri": "<原始 file uri>",
+      "revised_file_uri": "<write_revised_file 回傳的 uri；無建議則同 input_uri>",
+      "suggestions": [ ...該檔的 suggestions array... ]
+    }
+  ],
+  "cross_findings": "<繁體中文段落；無跨檔問題或單檔請填「無跨檔問題」；純諮詢請填「不適用」>"
+}
+```
+
+若是純諮詢任務（沒有處理檔案），`files` 填 `[]`，`cross_findings` 填「不適用」，回答寫在 `answer`。
+
+## 注意事項
+- 不可使用簡體中文或英文撰寫註記內文
+- 沒有依據時請註明「無對應依據」，severity 設為 "info"
+- 註記精簡，每則 ≤ 3 句
+- 不要在最終 ```json 區塊之後再寫任何文字
+"""
 
 
 def build_agent() -> Agent:
     """Build a fresh Agent per invocation to avoid carrying conversation history
-    between unrelated documents."""
+    between unrelated requests."""
     return Agent(
         model=load_model(),
         system_prompt=SYSTEM_PROMPT,
@@ -186,55 +201,94 @@ def _ev(type_: str, **fields: Any) -> str:
     return json.dumps({"type": type_, **fields}, ensure_ascii=False) + "\n"
 
 
-def _build_prompt(files: list[dict], task: str) -> str:
-    """Build the user-turn prompt. `files` is a list of {"uri","type"} dicts."""
-    lines = [f"Task: {task}", f"Number of files: {len(files)}"]
-    for i, f in enumerate(files, 1):
-        lines.append(f"File {i}: uri={f['uri']}  type={f['type']}")
-    lines.append("Run the multi-file workflow and return the final JSON in a fenced ```json block.")
+def _new_session_id() -> str:
+    """Generate a readable session id like rv-20260505T142233-ab12cd."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    suffix = uuid.uuid4().hex[:6]
+    return f"rv-{ts}-{suffix}"
+
+
+def _normalize_files(raw_files: Any) -> tuple[list[dict] | None, str | None]:
+    """Validate optional `files` list. Returns (files_or_None, error_or_None)."""
+    if raw_files is None:
+        return None, None
+    if not isinstance(raw_files, list):
+        return None, "files must be a list of {uri, type} objects"
+    if not raw_files:
+        return [], None
+    normalized: list[dict] = []
+    for i, f in enumerate(raw_files):
+        if not isinstance(f, dict):
+            return None, f"files[{i}] must be an object"
+        uri = f.get("uri")
+        ftype = f.get("type")
+        if not uri or not ftype:
+            return None, f"files[{i}] requires both 'uri' and 'type'"
+        if ftype not in ("pdf", "xlsx"):
+            return None, f"files[{i}].type must be 'pdf' or 'xlsx', got {ftype!r}"
+        normalized.append({"uri": uri, "type": ftype})
+    return normalized, None
+
+
+def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
+    """Strict validation of the new payload shape. No legacy compatibility."""
+    if not isinstance(payload, dict):
+        return None, "payload must be a JSON object"
+
+    # Reject legacy fields explicitly so old callers fail loudly.
+    legacy_fields = [k for k in ("file_uri", "file_type", "task", "mode") if k in payload]
+    if legacy_fields:
+        return None, (
+            f"legacy payload fields not supported: {legacy_fields}. "
+            "use {actor_id, instruction, files?} instead."
+        )
+
+    actor_id = payload.get("actor_id")
+    if not isinstance(actor_id, str) or not actor_id.strip():
+        return None, "actor_id is required and must be a non-empty string"
+
+    instruction = payload.get("instruction")
+    if not isinstance(instruction, str) or not instruction.strip():
+        return None, "instruction is required and must be a non-empty string"
+
+    files, err = _normalize_files(payload.get("files"))
+    if err:
+        return None, err
+
+    session_id = payload.get("session_id") or _new_session_id()
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None, "session_id, when provided, must be a non-empty string"
+
+    return {
+        "actor_id": actor_id.strip(),
+        "instruction": instruction.strip(),
+        "files": files or [],
+        "session_id": session_id,
+    }, None
+
+
+def _build_prompt(req: dict) -> str:
+    """Compose the user-turn prompt from the validated request."""
+    lines = [
+        f"actor_id: {req['actor_id']}",
+        f"session_id: {req['session_id']}",
+        f"files_count: {len(req['files'])}",
+    ]
+    for i, f in enumerate(req["files"], 1):
+        lines.append(f"  file {i}: uri={f['uri']}  type={f['type']}")
+    lines.append("")
+    lines.append("使用者指令（請依此 instruction 自行決定要呼叫哪些工具）：")
+    lines.append(req["instruction"])
+    lines.append("")
+    lines.append(f"完成後請以 fenced ```json 區塊回覆，且 session_id 欄位填 {req['session_id']!r}。")
     return "\n".join(lines)
-
-
-def _normalize_files(payload: dict) -> tuple[list[dict] | None, str | None]:
-    """Resolve payload to a list of {uri,type} dicts.
-
-    Accepts two payload shapes:
-      new:    {"files": [{"uri": "...", "type": "pdf|xlsx"}, ...]}
-      legacy: {"file_uri": "...", "file_type": "pdf|xlsx"}
-
-    Returns (files, error). Exactly one of them is None.
-    """
-    files = payload.get("files")
-    if files is not None:
-        if not isinstance(files, list) or not files:
-            return None, "files must be a non-empty list"
-        normalized: list[dict] = []
-        for i, f in enumerate(files):
-            if not isinstance(f, dict):
-                return None, f"files[{i}] must be an object"
-            uri = f.get("uri") or f.get("file_uri")
-            ftype = f.get("type") or f.get("file_type")
-            if not uri or not ftype:
-                return None, f"files[{i}] requires uri and type"
-            normalized.append({"uri": uri, "type": ftype})
-        return normalized, None
-    # Legacy single-file shape
-    uri = payload.get("file_uri")
-    ftype = payload.get("file_type")
-    if not uri or not ftype:
-        return None, "either `files` list, or `file_uri`+`file_type`, is required"
-    return [{"uri": uri, "type": ftype}], None
 
 
 _FENCE_OPEN_RE = re.compile(r"```json\s*", re.IGNORECASE)
 
 
 def _extract_result(final_text: str) -> dict | None:
-    """Pull the last ```json fenced block out of the assistant's final text.
-
-    Uses JSONDecoder.raw_decode so nested objects/arrays parse correctly
-    (a regex with ``\\{.*?\\}`` would stop at the first inner ``}``).
-    """
+    """Pull the last ```json fenced block out of the assistant's final text."""
     if not final_text:
         return None
     decoder = json.JSONDecoder()
@@ -270,16 +324,20 @@ def _message_text(message: dict | None) -> str:
 @app.entrypoint
 async def invoke(payload, context=None):
     log.info(f"Payload: {payload}")
-    task = payload.get("task", "review")
-    files, err = _normalize_files(payload)
+    req, err = _validate_payload(payload or {})
     if err:
         yield _ev("error", message=err)
         return
 
-    yield _ev("start", files=files, task=task)
+    yield _ev(
+        "start",
+        actor_id=req["actor_id"],
+        session_id=req["session_id"],
+        files=req["files"],
+        instruction=req["instruction"],
+    )
 
     # Cold-start prewarm: pull Tavily key from env (local) or AgentCore Identity (cloud).
-    # Done here (not at module import) so the runtime workload context is available.
     try:
         await _prewarm_tavily_key()
     except Exception as e:
@@ -291,7 +349,7 @@ async def invoke(payload, context=None):
 
     try:
         agent = build_agent()
-        async for event in agent.stream_async(_build_prompt(files, task)):
+        async for event in agent.stream_async(_build_prompt(req)):
             data = event.get("data")
             if isinstance(data, str):
                 final_text_parts.append(data)
@@ -312,6 +370,8 @@ async def invoke(payload, context=None):
         if result is None:
             yield _ev("error", message="failed to parse final ```json block")
             return
+        # Ensure session_id is present in result (agent may forget despite prompt)
+        result.setdefault("session_id", req["session_id"])
         yield _ev("result", data=result)
     except Exception as e:
         log.exception("agent error")
