@@ -10,6 +10,7 @@ returns an empty list / None so the agent runs unchanged.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from functools import lru_cache
@@ -82,6 +83,31 @@ def load_user_preferences(
     return prefs
 
 
+def _parse_pref(raw: str) -> tuple[str, str | None]:
+    """USER_PREFERENCE strategy stores extracted records as JSON-encoded strings,
+    e.g. {"context": "...", "preference": "...", "categories": [...]}. Pull the
+    human-relevant pieces out so format_preferences_block can render readable
+    bullets. Returns (preference_text, optional_context); falls back to (raw,
+    None) if the text isn't structured JSON or the shape is unexpected.
+    """
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        return raw, None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw, None
+    if not isinstance(obj, dict):
+        return raw, None
+    pref = obj.get("preference")
+    if not isinstance(pref, str) or not pref.strip():
+        return raw, None
+    context = obj.get("context")
+    if isinstance(context, str) and context.strip():
+        return pref.strip(), context.strip()
+    return pref.strip(), None
+
+
 def format_preferences_block(prefs: list[str]) -> str:
     """Render a preferences list as a Traditional-Chinese prompt fragment.
 
@@ -91,4 +117,10 @@ def format_preferences_block(prefs: list[str]) -> str:
     """
     if not prefs:
         return "（此使用者目前尚無記錄的偏好）"
-    return "\n".join(f"- {p}" for p in prefs)
+    lines: list[str] = []
+    for raw in prefs:
+        pref_text, context = _parse_pref(raw)
+        lines.append(f"- {pref_text}")
+        if context:
+            lines.append(f"  （情境：{context}）")
+    return "\n".join(lines)
