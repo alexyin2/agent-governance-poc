@@ -29,6 +29,7 @@ from strands import Agent, tool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from hooks.memory_hooks import DocReviewMemoryHooks
 from model.load import load_model
 from tools.file_reader import read_input_file as _read
 from tools.file_writer import write_revised_file as _write
@@ -187,13 +188,33 @@ Excel suggestion 欄位：
 """
 
 
-def build_agent() -> Agent:
+def _build_memory_hooks(actor_id: str, session_id: str) -> list:
+    """Attach the memory write-hook only when MEMORY_ID is configured.
+
+    Without it the agent runs exactly like before (Phase 1 behavior); with it,
+    every invocation persists one event under (actor_id, session_id).
+    """
+    memory_id = os.getenv("MEMORY_ID")
+    if not memory_id:
+        log.info("MEMORY_ID not set — running without memory persistence")
+        return []
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
+    return [DocReviewMemoryHooks(
+        memory_id=memory_id,
+        actor_id=actor_id,
+        session_id=session_id,
+        region=region,
+    )]
+
+
+def build_agent(actor_id: str, session_id: str) -> Agent:
     """Build a fresh Agent per invocation to avoid carrying conversation history
     between unrelated requests."""
     return Agent(
         model=load_model(),
         system_prompt=SYSTEM_PROMPT,
         tools=[read_input_file, search_knowledge_base, web_search, write_revised_file],
+        hooks=_build_memory_hooks(actor_id, session_id),
     )
 
 
@@ -348,7 +369,7 @@ async def invoke(payload, context=None):
     last_message: dict | None = None
 
     try:
-        agent = build_agent()
+        agent = build_agent(req["actor_id"], req["session_id"])
         async for event in agent.stream_async(_build_prompt(req)):
             data = event.get("data")
             if isinstance(data, str):

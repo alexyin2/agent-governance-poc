@@ -80,8 +80,8 @@ def _find_existing_memory(client: MemoryClient, name: str) -> dict[str, Any] | N
     """Return existing memory whose id starts with the configured name, or None.
 
     AgentCore memory ids look like '<name>-<random>'. The list_memories response
-    may not include the name field, so we match on id prefix (this is the same
-    approach the SRE agent sample uses).
+    may not include the name field nor the strategies list, so after locating
+    the id we enrich the dict via get_memory_strategies.
     """
     try:
         memories = client.list_memories(max_results=100)
@@ -92,6 +92,12 @@ def _find_existing_memory(client: MemoryClient, name: str) -> dict[str, Any] | N
     for m in memories:
         mid = m.get("id", "")
         if mid.startswith(f"{name}-") or m.get("name") == name:
+            # Enrich with strategies (list_memories doesn't include them).
+            try:
+                strategies = client.get_memory_strategies(memory_id=mid) or []
+                m = {**m, "strategies": strategies}
+            except Exception as e:
+                log.warning("get_memory_strategies(%s) failed: %s", mid, e)
             return m
     return None
 
@@ -190,7 +196,22 @@ def _delete_memory(client: MemoryClient, memory_id: str) -> None:
 # ---------- commands ---------------------------------------------------------
 
 
-def cmd_inspect(client: MemoryClient) -> int:
+def _format_namespace(template: str, actor_id: str, session_id: str | None) -> str | None:
+    """Substitute {actorId}/{sessionId} placeholders. Return None if a needed
+    variable is missing (e.g. namespace requires sessionId but we only got actor)."""
+    out = template.replace("{actorId}", actor_id)
+    if "{sessionId}" in out:
+        if not session_id:
+            return None
+        out = out.replace("{sessionId}", session_id)
+    return out
+
+
+def cmd_inspect(
+    client: MemoryClient,
+    actor_id: str | None = None,
+    session_id: str | None = None,
+) -> int:
     existing = _find_existing_memory(client, MEMORY_NAME)
     if not existing:
         print(f"(no memory found with name prefix '{MEMORY_NAME}')")
@@ -203,6 +224,62 @@ def cmd_inspect(client: MemoryClient) -> int:
         print(f"  - {s.get('name')} [{s.get('type', '?')}] status={s.get('status')}")
         for ns in s.get("namespaces", []) or []:
             print(f"      namespace: {ns}")
+
+    # ---- long-term view: extracted records via retrieve_memories --------------
+    if actor_id:
+        print()
+        print(f"long-term records for actor_id={actor_id}:")
+        any_records = False
+        for s in strategies:
+            for ns_template in s.get("namespaces", []) or []:
+                ns = _format_namespace(ns_template, actor_id, session_id)
+                if ns is None:
+                    print(f"  - {s.get('name')}: skipped (needs --session-id for {ns_template})")
+                    continue
+                try:
+                    records = client.retrieve_memories(
+                        memory_id=existing["id"],
+                        namespace=ns,
+                        query="*",
+                        top_k=10,
+                    )
+                except Exception as e:
+                    print(f"  - {s.get('name')} [{ns}]: retrieve failed: {e}")
+                    continue
+                print(f"  - {s.get('name')} [{ns}]: {len(records)} record(s)")
+                for r in records[:5]:
+                    text = (r.get("content", {}) or {}).get("text", "")
+                    if len(text) > 120:
+                        text = text[:120] + "…"
+                    score = r.get("score") or r.get("relevanceScore")
+                    print(f"      • [{score}] {text}")
+                if records:
+                    any_records = True
+        if not any_records:
+            print("  (none yet — strategies may still be extracting; retry in ~1 min)")
+
+    # ---- short-term view: raw events for one specific session ----------------
+    if actor_id and session_id:
+        print()
+        print(f"raw events for actor_id={actor_id} session_id={session_id}:")
+        try:
+            events = client.list_events(
+                memory_id=existing["id"],
+                actor_id=actor_id,
+                session_id=session_id,
+                max_results=20,
+                include_payload=False,
+            )
+            if not events:
+                print("  (none)")
+            else:
+                for ev in events:
+                    eid = ev.get("eventId", "?")
+                    ts = ev.get("eventTimestamp") or ev.get("createdAt", "?")
+                    print(f"  - {eid}  ts={ts}")
+        except Exception as e:
+            print(f"  (list_events failed: {e})")
+
     return 0
 
 
@@ -240,6 +317,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--inspect", action="store_true",
                         help="show current state, do not modify anything")
+    parser.add_argument("--actor-id", default=None,
+                        help="(with --inspect) show long-term records for this actor")
+    parser.add_argument("--session-id", default=None,
+                        help="(with --inspect --actor-id) also dump raw events for this session")
     parser.add_argument("--force-delete", action="store_true",
                         help="DESTRUCTIVE: delete existing memory before recreating")
     args = parser.parse_args()
@@ -249,7 +330,7 @@ def main() -> int:
     client = MemoryClient(region_name=region)
 
     if args.inspect:
-        return cmd_inspect(client)
+        return cmd_inspect(client, actor_id=args.actor_id, session_id=args.session_id)
     return cmd_setup(client, force_delete=args.force_delete)
 
 
