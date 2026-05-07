@@ -29,6 +29,8 @@ from strands import Agent, tool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from memory.hooks import DocReviewMemoryHooks
+from memory.preferences import format_preferences_block, load_user_preferences
 from model.load import load_model
 from tools.file_reader import read_input_file as _read
 from tools.file_writer import write_revised_file as _write
@@ -131,6 +133,13 @@ SYSTEM_PROMPT = """你是文件審查與顧問助理。所有自然語言輸出�
 2. **一般諮詢** — 回答跟過去審查、政策、法規相關的問題（無需檔案）。
 3. **混合任務** — 同時執行上述兩者（例如：審這份新檔案並對照過去案件）。
 
+## 使用者偏好（由系統從過去互動中萃取，請納入審查與回答考量）
+<preferences>
+{PREFERENCES_BLOCK}
+</preferences>
+
+當使用者偏好與本次 instruction 衝突時，以本次 instruction 為主，並在 answer 中簡短說明為何忽略偏好。
+
 ## 可用工具
 - `read_input_file(file_uri, file_type)` — 讀取 PDF / Excel 結構化內容
 - `search_knowledge_base(query)` — 查內部政策、SOP、過去案件（優先使用）
@@ -187,13 +196,47 @@ Excel suggestion 欄位：
 """
 
 
-def build_agent() -> Agent:
+def _build_memory_hooks(actor_id: str, session_id: str) -> list:
+    """Attach the memory write-hook only when MEMORY_ID is configured.
+
+    Without it the agent runs exactly like before (Phase 1 behavior); with it,
+    every invocation persists one event under (actor_id, session_id).
+    """
+    memory_id = os.getenv("MEMORY_ID")
+    if not memory_id:
+        log.info("MEMORY_ID not set — running without memory persistence")
+        return []
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
+    return [DocReviewMemoryHooks(
+        memory_id=memory_id,
+        actor_id=actor_id,
+        session_id=session_id,
+        region=region,
+    )]
+
+
+def _build_system_prompt(actor_id: str) -> str:
+    """Inject the actor's stored USER_PREFERENCE records into the prompt.
+
+    Returns SYSTEM_PROMPT with the {PREFERENCES_BLOCK} placeholder replaced
+    by either a bullet list of preferences or a placeholder line. Never
+    raises — if memory retrieval fails, prefs is [] and the agent runs as
+    if this user has no prior preferences.
+    """
+    prefs = load_user_preferences(actor_id)
+    if prefs:
+        log.info("injected %d preference(s) for actor=%s", len(prefs), actor_id)
+    return SYSTEM_PROMPT.replace("{PREFERENCES_BLOCK}", format_preferences_block(prefs))
+
+
+def build_agent(actor_id: str, session_id: str) -> Agent:
     """Build a fresh Agent per invocation to avoid carrying conversation history
     between unrelated requests."""
     return Agent(
         model=load_model(),
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=_build_system_prompt(actor_id),
         tools=[read_input_file, search_knowledge_base, web_search, write_revised_file],
+        hooks=_build_memory_hooks(actor_id, session_id),
     )
 
 
@@ -348,7 +391,7 @@ async def invoke(payload, context=None):
     last_message: dict | None = None
 
     try:
-        agent = build_agent()
+        agent = build_agent(req["actor_id"], req["session_id"])
         async for event in agent.stream_async(_build_prompt(req)):
             data = event.get("data")
             if isinstance(data, str):
