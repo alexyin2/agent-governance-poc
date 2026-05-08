@@ -217,15 +217,18 @@ Excel suggestion 欄位：
 """
 
 
-def _build_memory_hooks(actor_id: str, session_id: str) -> list:
-    """Attach the memory write-hook only when MEMORY_ID is configured.
-
-    Without it the agent runs exactly like before (Phase 1 behavior); with it,
-    every invocation persists one event under (actor_id, session_id).
+def _build_memory_hooks(actor_id: str | None, session_id: str) -> list:
+    """Attach the memory write-hook only when both MEMORY_ID and actor_id
+    are present. Without an actor we cannot satisfy the AgentCore CreateEvent
+    API contract, and we explicitly want anonymous callers to skip memory
+    rather than share a default identity.
     """
     memory_id = os.getenv("MEMORY_ID")
-    if not memory_id:
-        log.info("MEMORY_ID not set — running without memory persistence")
+    if not actor_id or not memory_id:
+        log.info(
+            "memory disabled for this invocation (actor_id=%s, MEMORY_ID set=%s)",
+            actor_id, bool(memory_id),
+        )
         return []
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
     return [DocReviewMemoryHooks(
@@ -236,21 +239,21 @@ def _build_memory_hooks(actor_id: str, session_id: str) -> list:
     )]
 
 
-def _build_system_prompt(actor_id: str) -> str:
+def _build_system_prompt(actor_id: str | None) -> str:
     """Inject the actor's stored USER_PREFERENCE records into the prompt.
 
     Returns SYSTEM_PROMPT with the {PREFERENCES_BLOCK} placeholder replaced
     by either a bullet list of preferences or a placeholder line. Never
-    raises — if memory retrieval fails, prefs is [] and the agent runs as
-    if this user has no prior preferences.
+    raises — if memory retrieval fails or no actor_id was provided, prefs
+    is [] and the agent runs as if this user has no prior preferences.
     """
-    prefs = load_user_preferences(actor_id)
+    prefs = load_user_preferences(actor_id) if actor_id else []
     if prefs:
         log.info("injected %d preference(s) for actor=%s", len(prefs), actor_id)
     return SYSTEM_PROMPT.replace("{PREFERENCES_BLOCK}", format_preferences_block(prefs))
 
 
-def build_agent(actor_id: str, session_id: str) -> Agent:
+def build_agent(actor_id: str | None, session_id: str) -> Agent:
     """Build a fresh Agent per invocation to avoid carrying conversation history
     between unrelated requests."""
     return Agent(
@@ -307,9 +310,17 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
             "use {actor_id, instruction, files?} instead."
         )
 
-    actor_id = payload.get("actor_id")
-    if not isinstance(actor_id, str) or not actor_id.strip():
-        return None, "actor_id is required and must be a non-empty string"
+    # actor_id is OPTIONAL. Without it the request is processed in stateless
+    # mode (no preference injection, no event write, no history recall) — that
+    # mirrors Phase 1 behaviour so smoke tests / anonymous callers still work
+    # without polluting memory namespaces with a shared "anonymous" identity.
+    actor_id_raw = payload.get("actor_id")
+    if actor_id_raw is None:
+        actor_id: str | None = None
+    elif isinstance(actor_id_raw, str) and actor_id_raw.strip():
+        actor_id = actor_id_raw.strip()
+    else:
+        return None, "actor_id, when provided, must be a non-empty string"
 
     instruction = payload.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip():
@@ -326,11 +337,12 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
         return None, "session_id, when provided, must be a non-empty string"
 
     return {
-        "actor_id": actor_id.strip(),
+        "actor_id": actor_id,                    # str or None
         "instruction": instruction.strip(),
         "files": files or [],
         "session_id": session_id,
         "is_continuation": is_continuation,
+        "memory_enabled": actor_id is not None,
     }, None
 
 
@@ -417,6 +429,7 @@ async def invoke(payload, context=None):
         files=req["files"],
         instruction=req["instruction"],
         is_continuation=req["is_continuation"],
+        memory_enabled=req["memory_enabled"],
     )
 
     # Cold-start prewarm: pull Tavily key from env (local) or AgentCore Identity (cloud).
@@ -426,8 +439,10 @@ async def invoke(payload, context=None):
         log.warning(f"Tavily key prewarm failed (web_search will error if used): {e}")
 
     # Block C: load short-term recall when caller is continuing an existing session.
+    # Skipped entirely when actor_id is missing — get_last_k_turns requires it
+    # and an anonymous "history" makes no sense.
     history_block = ""
-    if req["is_continuation"]:
+    if req["actor_id"] and req["is_continuation"]:
         recent = load_recent_turns(req["actor_id"], req["session_id"], k=5)
         history_block = format_recent_turns_block(recent)
         log.info(
