@@ -49,6 +49,10 @@ logging.basicConfig(level=logging.INFO)
 MAX_PDF_PAGES = 40
 MAX_XLSX_CELLS_PER_SHEET = 500
 
+# Substituted into the prompt when caller supplies files but no instruction —
+# the file upload itself is treated as an implicit "please review" intent.
+DEFAULT_REVIEW_INSTRUCTION = "請依公司政策審查所有附檔"
+
 
 def _truncate_for_llm(content: dict) -> dict:
     """Structurally trim oversized content so the LLM gets valid JSON, not a sliced string."""
@@ -322,13 +326,25 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
     else:
         return None, "actor_id, when provided, must be a non-empty string"
 
-    instruction = payload.get("instruction")
-    if not isinstance(instruction, str) or not instruction.strip():
-        return None, "instruction is required and must be a non-empty string"
-
     files, err = _normalize_files(payload.get("files"))
     if err:
         return None, err
+
+    # instruction is optional ONLY when files are supplied — uploading a file
+    # already implies a review intent, so we substitute a sensible default.
+    # An explicit empty string is still rejected (likely caller bug).
+    instruction_raw = payload.get("instruction")
+    instruction_was_default = False
+    if instruction_raw is None:
+        if files:
+            instruction = DEFAULT_REVIEW_INSTRUCTION
+            instruction_was_default = True
+        else:
+            return None, "either `instruction` or `files` is required"
+    elif isinstance(instruction_raw, str) and instruction_raw.strip():
+        instruction = instruction_raw.strip()
+    else:
+        return None, "instruction, when provided, must be a non-empty string"
 
     raw_session = payload.get("session_id")
     is_continuation = isinstance(raw_session, str) and bool(raw_session.strip())
@@ -338,7 +354,8 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
 
     return {
         "actor_id": actor_id,                    # str or None
-        "instruction": instruction.strip(),
+        "instruction": instruction,
+        "instruction_was_default": instruction_was_default,
         "files": files or [],
         "session_id": session_id,
         "is_continuation": is_continuation,
@@ -428,6 +445,7 @@ async def invoke(payload, context=None):
         session_id=req["session_id"],
         files=req["files"],
         instruction=req["instruction"],
+        instruction_was_default=req["instruction_was_default"],
         is_continuation=req["is_continuation"],
         memory_enabled=req["memory_enabled"],
     )
