@@ -34,12 +34,15 @@ from memory.hooks import DocReviewMemoryHooks
 from memory.preferences import format_preferences_block, load_user_preferences
 from memory.short_term import format_recent_turns_block, load_recent_turns
 from model.load import load_model
+from tools.file_loader import infer_file_type as _infer_type
 from tools.file_loader import load_file as _load_file
-from tools.file_writer import annotate_file as _annotate
+from tools.file_writer import annotate_pdf as _annotate_pdf
+from tools.file_writer import annotate_xlsx as _annotate_xlsx
 from tools.kb_search import search_knowledge_base as _kb
-from tools.pdf_inspect import get_pdf_text_positions as _pdf_positions
+from tools.pdf_inspect import inspect_pdf_page as _inspect_pdf
 from tools.web_search import prewarm_key as _prewarm_tavily_key
 from tools.web_search import web_search as _web
+from tools.xlsx_inspect import inspect_xlsx_sheet as _inspect_xlsx
 
 load_dotenv()
 
@@ -53,7 +56,7 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 
 
 @tool
-def load_file(file_uri: str, file_type: str) -> dict:
+def load_file(file_uri: str) -> dict:
     """Load a PDF or Excel file into the conversation so you can see it.
 
     When to call:
@@ -64,22 +67,23 @@ def load_file(file_uri: str, file_type: str) -> dict:
     Do NOT call this for files already in this turn's payload — those are
     pre-loaded automatically before you start.
 
+    The file type is inferred from the URI extension (.pdf / .xlsx / .xlsm / .xls).
+
     Args:
         file_uri: An ``s3://bucket/key`` URI or a local filesystem path.
-        file_type: ``"pdf"`` or ``"xlsx"``.
     """
-    return _load_file(file_uri, file_type)
+    return _load_file(file_uri)
 
 
 @tool
-def get_pdf_text_positions(file_uri: str, page: int) -> str:
+def inspect_pdf_page(file_uri: str, page: int) -> str:
     """Return text blocks + bbox coordinates for a single PDF page.
 
     When to call:
     - You need a precise bbox to anchor an annotation, and `anchor_text` alone
       would be ambiguous (e.g. a checklist where "是" / "否" repeats).
     - General review usually doesn't need this — prefer `anchor_text` in your
-      suggestion and let `annotate_file` resolve it via text search.
+      suggestion and let `annotate_pdf` resolve it via text search.
 
     Args:
         file_uri: Same URI used with ``load_file`` / the pre-loaded document.
@@ -87,9 +91,31 @@ def get_pdf_text_positions(file_uri: str, page: int) -> str:
 
     Returns: JSON string with a list of `{block_id, bbox, text}` items.
     Coordinates use `pdf-points-top-left`. Pass a block's `bbox` straight back
-    as the `bbox` field of a suggestion in `annotate_file`.
+    as the `bbox` field of a suggestion in `annotate_pdf`.
     """
-    return _pdf_positions(file_uri, page)
+    return _inspect_pdf(file_uri, page)
+
+
+@tool
+def inspect_xlsx_sheet(file_uri: str, sheet: str | None = None) -> str:
+    """Return a sheet's content (with A1-style column letters) for precise xlsx annotation.
+
+    When to call:
+    - Before `annotate_xlsx` on a structured checklist, when you need to know
+      which column letter holds 「評估意見 / 意見 / 備註」 etc.
+    - You want to confirm a sheet's structure before placing comments.
+    - Don't call for ad-hoc edits when you already know exact cell addresses.
+
+    Args:
+        file_uri: Same URI used with ``load_file`` / the pre-loaded document.
+        sheet: Optional sheet name. Defaults to the active sheet.
+
+    Returns: JSON string of the form
+    ``{all_sheets, sheet, dimensions, rows:[{row, cells:[{col, text}]}], truncated}``.
+    Empty cells are omitted. You decide which row is the header and which
+    column is the "opinion" column from the content; no server-side guessing.
+    """
+    return _inspect_xlsx(file_uri, sheet)
 
 
 @tool
@@ -116,42 +142,76 @@ def web_search(query: str) -> str:
     return json.dumps(_web(query))
 
 
-@tool
-def annotate_file(file_uri: str, file_type: str, suggestions_json: str) -> str:
-    """Write annotations back into the source file (PDF sticky / Excel comment).
+def _parse_suggestions(suggestions_json: str) -> tuple[list | None, str | None]:
+    try:
+        data = json.loads(suggestions_json)
+    except json.JSONDecodeError as e:
+        return None, f"ERROR: suggestions_json is not valid JSON ({e}). Re-emit with a valid JSON array."
+    if not isinstance(data, list):
+        return None, "ERROR: suggestions_json must decode to a list. Wrap your suggestions in []."
+    return data, None
 
-    When to call: the user asked you to review / audit / annotate / leave comments
-    on a file. Do NOT call this for pure summarisation, explanation, or chat.
+
+@tool
+def annotate_pdf(file_uri: str, suggestions_json: str) -> str:
+    """Write sticky-note + highlight annotations onto a PDF and save the revised file.
+
+    When to call: the user asked you to review / audit / mark / annotate / comment
+    on a PDF. Do NOT call this for pure summary, explanation, or chat.
 
     Args:
-        file_uri: Original file location (same as the input file uri).
-        file_type: 'pdf' or 'xlsx'.
+        file_uri: Original PDF location (s3:// or local path).
         suggestions_json: JSON string decoding to a list of suggestions.
 
-    PDF suggestion fields:
-      finding_id (str), page (int, 1-indexed), severity ("pass"|"info"|"warning"|"critical"),
-      text (str, ≤3 sentences, 繁體中文), AND at least one of:
-        - bbox: [x0,y0,x1,y1]  (most precise; get from get_pdf_text_positions)
-        - anchor_text: str     (≥8 chars, must be unique on the page; include surrounding
-                                identifiers e.g. "R-03 風險評估等級：低")
-        - region: "full_page" | "top_half" | "bottom_half" (for visual elements with no text)
+    Each suggestion MUST contain these keys (canonical key names, do not rename):
+      - finding_id: str        unique id within this file (e.g. "f1", "f2")
+      - page: int              1-indexed page number
+      - severity: str          one of "pass" | "info" | "warning" | "critical"
+      - text: str              ⚠️ KEY MUST BE "text" — body content in 繁體中文, ≤3 sentences.
+                                NOT "comment" / "body" / "content" — use "text" exactly.
 
-    Excel suggestion fields:
-      finding_id (str), sheet (str), cell (str e.g. "B5"),
-      severity ("pass"|"info"|"warning"|"critical"), text (str, 繁體中文)
+    AND at least one of the following positioning fields:
+      - bbox: [x0,y0,x1,y1]    most precise; get from get_pdf_text_positions
+      - anchor_text: str       ≥8 chars, must be unique on the page; include surrounding
+                                identifiers e.g. "R-03 風險評估等級：低"
+      - region: "full_page" | "top_half" | "bottom_half"   visual elements with no text
 
-    Resolution priority for PDF: bbox > anchor_text > region. If none resolve,
-    the note falls back to the page's top-left corner.
+    Resolution priority: bbox > anchor_text > region. If none resolve, the note
+    falls back to the page's top-left corner.
 
-    Returns: URI (local path or s3://...) of the revised file.
+    Returns: URI (local path or s3://...) of the revised PDF.
     """
-    try:
-        suggestions = json.loads(suggestions_json)
-    except json.JSONDecodeError as e:
-        return f"ERROR: suggestions_json is not valid JSON ({e}). Re-emit the call with a valid JSON array."
-    if not isinstance(suggestions, list):
-        return "ERROR: suggestions_json must decode to a list. Wrap your suggestions in []."
-    return _annotate(file_uri, file_type, suggestions)
+    suggestions, err = _parse_suggestions(suggestions_json)
+    if err:
+        return err
+    return _annotate_pdf(file_uri, suggestions)
+
+
+@tool
+def annotate_xlsx(file_uri: str, suggestions_json: str) -> str:
+    """Attach cell comments to an Excel workbook and save the revised file.
+
+    When to call: the user asked you to review / audit / mark / annotate / comment
+    on an Excel sheet (e.g. checklist audit). Do NOT call for summary or chat.
+
+    Args:
+        file_uri: Original xlsx location (s3:// or local path).
+        suggestions_json: JSON string decoding to a list of suggestions.
+
+    Each suggestion MUST contain these keys (canonical key names, do not rename):
+      - finding_id: str        unique id within this file
+      - sheet: str             worksheet name (defaults to first sheet if absent)
+      - cell: str              A1-style address, e.g. "B5"
+      - severity: str          one of "pass" | "info" | "warning" | "critical"
+      - text: str              ⚠️ KEY MUST BE "text" — body content in 繁體中文, ≤3 sentences.
+                                NOT "comment" / "body" / "content" — use "text" exactly.
+
+    Returns: URI (local path or s3://...) of the revised xlsx.
+    """
+    suggestions, err = _parse_suggestions(suggestions_json)
+    if err:
+        return err
+    return _annotate_xlsx(file_uri, suggestions)
 
 
 def _load_system_prompt_template() -> str:
@@ -211,10 +271,12 @@ def build_agent(actor_id: str | None, session_id: str) -> Agent:
         system_prompt=_build_system_prompt(actor_id),
         tools=[
             load_file,
-            get_pdf_text_positions,
+            inspect_pdf_page,
+            inspect_xlsx_sheet,
             search_knowledge_base,
             web_search,
-            annotate_file,
+            annotate_pdf,
+            annotate_xlsx,
         ],
         hooks=_build_memory_hooks(actor_id, session_id),
     )
@@ -232,11 +294,16 @@ def _new_session_id() -> str:
 
 
 def _normalize_files(raw_files: Any) -> tuple[list[dict] | None, str | None]:
-    """Validate optional `files` list. Returns (files_or_None, error_or_None)."""
+    """Validate optional `files` list. Returns (files_or_None, error_or_None).
+
+    `type` in each entry is optional — if absent we infer it from the URI's
+    extension. Explicit `type` (if provided) must still be 'pdf' or 'xlsx' and
+    overrides the inference.
+    """
     if raw_files is None:
         return None, None
     if not isinstance(raw_files, list):
-        return None, "files must be a list of {uri, type} objects"
+        return None, "files must be a list of {uri, type?} objects"
     if not raw_files:
         return [], None
     normalized: list[dict] = []
@@ -244,9 +311,14 @@ def _normalize_files(raw_files: Any) -> tuple[list[dict] | None, str | None]:
         if not isinstance(f, dict):
             return None, f"files[{i}] must be an object"
         uri = f.get("uri")
-        ftype = f.get("type")
-        if not uri or not ftype:
-            return None, f"files[{i}] requires both 'uri' and 'type'"
+        if not uri:
+            return None, f"files[{i}] requires 'uri'"
+        ftype = f.get("type") or _infer_type(uri)
+        if not ftype:
+            return None, (
+                f"files[{i}]: cannot infer type from uri {uri!r}; "
+                "either rename with .pdf/.xlsx extension or pass 'type' explicitly"
+            )
         if ftype not in ("pdf", "xlsx"):
             return None, f"files[{i}].type must be 'pdf' or 'xlsx', got {ftype!r}"
         normalized.append({"uri": uri, "type": ftype})

@@ -18,10 +18,25 @@ from pathlib import Path
 from typing import Any
 
 
-_SUPPORTED_TYPES = {"pdf", "xlsx"}
+_PDF_EXTS = (".pdf",)
+_XLSX_EXTS = (".xlsx", ".xlsm", ".xls")
 
 
-def load_file(file_uri: str, file_type: str) -> dict[str, Any]:
+def infer_file_type(file_uri: str) -> str | None:
+    """Return ``"pdf"`` or ``"xlsx"`` based on the URI's extension; None if unknown.
+
+    Shared helper used by both the loader tool and the runtime's pre-load path
+    so the inference rule lives in exactly one place.
+    """
+    low = file_uri.lower()
+    if low.endswith(_PDF_EXTS):
+        return "pdf"
+    if low.endswith(_XLSX_EXTS):
+        return "xlsx"
+    return None
+
+
+def load_file(file_uri: str) -> dict[str, Any]:
     """Load a PDF or Excel file into the conversation so you can see it.
 
     When to call:
@@ -32,17 +47,19 @@ def load_file(file_uri: str, file_type: str) -> dict[str, Any]:
     Do NOT call this for files already in this turn's payload — those are
     pre-loaded automatically before you start.
 
+    File type is inferred from the URI extension (.pdf / .xlsx / .xlsm / .xls).
+
     Args:
         file_uri: An ``s3://bucket/key`` URI or a local filesystem path.
-        file_type: ``"pdf"`` or ``"xlsx"``.
 
     Returns: a tool result containing the document block (so you can see it) +
     a short confirmation text. The model receives this as native multimodal input.
     """
-    if file_type not in _SUPPORTED_TYPES:
+    file_type = infer_file_type(file_uri)
+    if file_type is None:
         return {
             "status": "error",
-            "content": [{"text": f"unsupported file_type: {file_type!r}. expected one of {sorted(_SUPPORTED_TYPES)}"}],
+            "content": [{"text": f"cannot infer file type from URI: {file_uri!r}. Expected .pdf / .xlsx."}],
         }
 
     if file_uri.startswith("s3://"):

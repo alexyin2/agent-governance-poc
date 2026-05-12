@@ -30,14 +30,14 @@ def _resolve_uri(file_uri: str) -> str:
     return file_uri
 
 
-def get_pdf_text_positions(file_uri: str, page: int) -> str:
+def inspect_pdf_page(file_uri: str, page: int) -> str:
     """Return text blocks + bbox coordinates for a single page of a PDF.
 
     When to call:
     - You need a precise bbox to annotate a specific position and `anchor_text`
       alone would be ambiguous (e.g. checklist with repeated "是" answers).
     - General review usually doesn't need this — prefer `anchor_text` in your
-      suggestion and let `annotate_file` resolve it via text search.
+      suggestion and let `annotate_pdf` resolve it via text search.
 
     Args:
         file_uri: Same URI used with ``load_file`` / pre-loaded document.
