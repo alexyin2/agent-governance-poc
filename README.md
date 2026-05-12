@@ -1,27 +1,31 @@
 # Agent Governance PoC — Document Review Agent on AWS AgentCore
 
-PoC：上傳 PDF / Excel → Agent 對照 Bedrock KB + Web 搜尋 → 產出 JSON 建議 + 寫回原檔（PDF 註解 / Excel comment）。
+PoC：上傳 PDF / Excel → Agent 多模態看懂內容（文字 + 版面 + 圖表）→ 對照 Bedrock KB + Web 搜尋 → 依使用者 instruction 決定行為（摘要 / 審查 / 註記 / 跨檔比對）→ 必要時寫回原檔（PDF 註解 / Excel comment）。
 
 ## 架構
 
 ```
-input file (PDF/XLSX)
+input files (PDF/XLSX)
+        │  (預載為 Bedrock document content blocks，Claude 直接看到視覺)
+        ▼
+┌──────────────────────────────┐
+│ AgentCore Runtime            │
+│  Strands Agent (Opus 4.6)    │
+│   ├ load_file                │  agent 主動載入 history 提到的檔案
+│   ├ get_pdf_text_positions   │  PyMuPDF — 補精準 bbox
+│   ├ search_knowledge_base    │  Bedrock KB
+│   ├ web_search               │  Tavily
+│   └ annotate_file            │  寫回 PDF 註解 / Excel comment
+└──────────────────────────────┘
         │
         ▼
-┌────────────────────────┐
-│ AgentCore Runtime      │
-│  Strands Agent         │
-│   ├ read_input_file    │  (PyMuPDF / openpyxl)
-│   ├ search_kb          │  ─► Bedrock Knowledge Base
-│   ├ web_search         │  ─► Tavily
-│   └ write_revised_file │  ─► outputs/ (+ optional S3)
-└────────────────────────┘
-        │
-        ▼
-JSON suggestions + 修訂版檔案
+JSON 回應（answer + outputs 含修訂版檔案 URI）
 ```
 
-模型：Claude Opus 4.6 (Bedrock)。
+關鍵設計：
+- **多模態載入**：payload 的 `files` 全部 pre-load 為 Bedrock `document` content block，agent 一開始就「看到」整份 PDF/Excel（含圖表、版面）。`s3://` URI 直接傳給 Bedrock runtime fetch，不在 agent 本地下載。
+- **工具自由組合**：沒有強制流程。Agent 依 instruction 決定要不要查 KB、要不要寫回。`outputs:[]` 表示純對話 / 摘要。
+- **三種定位寫入**：annotate_file 接受 `bbox`（最精準）/ `anchor_text`（≥8 字、含上下文識別符）/ `region`（視覺元件），優先序 bbox > anchor_text > region。
 
 ## Quick Start
 
@@ -126,20 +130,30 @@ agentcore launch \
   --env S3_BUCKET="$S3_BUCKET"
 # AWS_REGION 由 Runtime 自動注入；TAVILY_API_KEY 走 Identity 不傳
 
-agentcore invoke '{"file_uri":"s3://<bucket>/inputs/input.pdf","file_type":"pdf"}'
-
-# 多檔同時審查（cross-file 一致性檢查）：
 agentcore invoke '{
+  "actor_id":"alex",
+  "instruction":"請依公司政策審查這份 CAB 申請",
+  "files":[{"uri":"s3://<bucket>/inputs/cab.pdf","type":"pdf"}]
+}'
+
+# 多檔同時審查（agent 自動做 cross-file 一致性檢查）：
+agentcore invoke '{
+  "actor_id":"alex",
+  "instruction":"審查 CAB 並對照填寫的檢核表",
   "files": [
-    {"uri":"s3://<bucket>/inputs/cab.pdf",          "type":"pdf"},
-    {"uri":"s3://<bucket>/inputs/risk_assessment.xlsx","type":"xlsx"}
+    {"uri":"s3://<bucket>/inputs/cab.pdf",       "type":"pdf"},
+    {"uri":"s3://<bucket>/inputs/checklist.xlsx","type":"xlsx"}
   ]
 }'
 ```
 
-Payload 兩種寫法都支援（向後相容）：
-- 舊單檔：`{"file_uri":..., "file_type":...}`
-- 新多檔：`{"files":[{"uri":..., "type":...}, ...]}` — agent 會跨檔交叉驗證，result 會多一個 `cross_findings` 欄位
+**Payload schema**：
+- `actor_id` (optional, str) — 啟用 memory（偏好注入、recent history）。缺則 stateless。
+- `instruction` (**required**, str) — 自然語言指令，agent 依此決定要做什麼。
+- `files` (optional, list) — `[{uri, type}]`，type 為 `"pdf"` 或 `"xlsx"`。可空，純諮詢時不附即可。
+- `session_id` (optional, str) — 帶上同一個 id 表示接續 session（會載入 `<recent_history>`）。
+
+> 舊欄位 `file_uri` / `file_type` / `task` / `mode` 已不支援，會立刻 reject。
 
 > 萬一 Console 建 provider 也被擋（公司未來改 SCP 範圍可能）：暫時加 `--env TAVILY_API_KEY="$TAVILY_API_KEY"` 走 env-var 後備路徑。`prewarm_key()` 邏輯是「env var 優先 → 沒有才打 Identity」，env 被清掉就會自然走 Identity，code 不用改。
 
@@ -172,26 +186,52 @@ CloudWatch logs 應顯示工具呼叫鏈。
 ```
 s3://$S3_BUCKET/
 ├── inputs/<filename>.{pdf,xlsx}        ← 呼叫端先 putObject 到這裡
-└── outputs/<filename>_revised_<UTC-timestamp>.{pdf,xlsx}  ← agent 寫回此處，URI 放在 result.revised_file_uri
+└── outputs/<filename>_revised_<UTC-timestamp>.{pdf,xlsx}  ← agent 寫回此處，URI 放在 result.outputs[].output_uri
 ```
 
 呼叫範例：
 ```bash
-aws s3 cp samples/input_sample.pdf s3://$S3_BUCKET/inputs/
-agentcore invoke '{"file_uri":"s3://'$S3_BUCKET'/inputs/input_sample.pdf","file_type":"pdf"}'
-# result.revised_file_uri => s3://$S3_BUCKET/outputs/input_sample_revised_20260504T044812Z.pdf
+aws s3 cp samples/aies_cab1.pdf  s3://$S3_BUCKET/inputs/
+aws s3 cp samples/aies_cab1.xlsx s3://$S3_BUCKET/inputs/
+
+agentcore invoke '{
+  "actor_id":"alex",
+  "instruction":"審查 CAB 並對照填寫的檢核表",
+  "files":[
+    {"uri":"s3://'$S3_BUCKET'/inputs/aies_cab1.pdf","type":"pdf"},
+    {"uri":"s3://'$S3_BUCKET'/inputs/aies_cab1.xlsx","type":"xlsx"}
+  ]
+}'
+# result.outputs[*].output_uri => s3://$S3_BUCKET/outputs/aies_cab1_revised_20260504T044812Z.pdf 等
 ```
+
+> Bedrock document block 直接吃 `s3://` 來源（透過 Runtime execution role 的 `s3:GetObject` 權限），不在 agent 本地下載。`annotate_file` 才需要把檔案抓回來修改後 PutObject 回 `outputs/`。
 
 本地開發 `S3_BUCKET` 留空即可 — `tools/file_writer.py` 的 `_maybe_upload` 偵測沒設就只寫 `outputs/` 本地目錄。
 
 > PoC 階段直接回傳 `s3://` URI，假設呼叫端有讀 bucket 的權限。若未來 client 沒有 AWS 身份，再改成回 presigned URL。
 
+## 審查模式範例
+
+Agent 依 `instruction` 自由組合工具，**沒有固定流程**。常見組合：
+
+| 情境 | instruction 範例 | 行為 |
+|---|---|---|
+| 純摘要 | 「總結這份 CAB 的範疇與目的」 | 看內容 → 答 → `outputs:[]` |
+| 政策審查 | 「依公司政策審查這份 CAB 並加註記」 | 看 → `search_knowledge_base` → `annotate_file` |
+| 跨輪追問 | （Turn 2，無 files）「剛剛那份 PDF 第 3 頁細節給意見」 | `load_file`(從 history 取 URI) → 答 |
+| 逐題審查 | 「對檢核表每題填答給 pass/fail 與依據」+ [pdf, xlsx] | 看雙檔 → `annotate_file`(xlsx) 每 cell 一個 comment |
+
 ## 專案結構
-- `app/main.py` — Strands agent + `@app.entrypoint`
-- `tools/` — file_reader / kb_search / web_search / file_writer
+- `app/main.py` — Strands agent + `@app.entrypoint`，組 multimodal ContentBlocks + 工具註冊
+- `app/prompts/system.md` — 外部化的 system prompt（XML-tag 分區）
+- `tools/file_loader.py` — `load_file`：多模態載入 PDF/Excel 為 document block
+- `tools/pdf_inspect.py` — `get_pdf_text_positions`：單頁 text blocks + bbox
+- `tools/kb_search.py` / `tools/web_search.py` — KB / Tavily 搜尋
+- `tools/file_writer.py` — `annotate_file`：bbox / anchor_text / region 三段定位 + 寫回
+- `memory/` — preferences / hooks / short_term recall
 - `model/load.py` — Bedrock model ID
-- `scripts/aws_session.sh` — `init` / `mfa` / `status`，sourceable，處理 MFA 換 session token
-- `scripts/setup_kb.md` — KB 建立步驟
+- `scripts/aws_session.sh` — `init` / `mfa` / `status`
 - `scripts/invoke_local.py` — 本地 smoke test
 
 ## Streaming Protocol (NDJSON)
@@ -200,7 +240,7 @@ agentcore invoke '{"file_uri":"s3://'$S3_BUCKET'/inputs/input_sample.pdf","file_
 
 | `type` | 欄位 | 何時出現 |
 |---|---|---|
-| `start` | `file_uri`, `file_type`, `task` | 開頭一次 |
+| `start` | `actor_id`, `session_id`, `files`, `instruction`, `is_continuation`, `memory_enabled` | 開頭一次 |
 | `text` | `delta` (str) | LLM 文字 token 串流 |
 | `tool_start` | `name`, `input` | 每個工具被呼叫時一次（已 dedup by `toolUseId`） |
 | `result` | `data` (object) | 結束時，從最後 assistant message 的 ` ```json ` fence 解出的 JSON |
@@ -208,13 +248,16 @@ agentcore invoke '{"file_uri":"s3://'$S3_BUCKET'/inputs/input_sample.pdf","file_
 
 範例輸出：
 ```
-{"type":"start","file_uri":"samples/x.pdf","file_type":"pdf","task":"review"}
-{"type":"text","delta":"先讀取"}
-{"type":"text","delta":"檔案..."}
-{"type":"tool_start","name":"read_input_file","input":{"file_uri":"...","file_type":"pdf"}}
+{"type":"start","actor_id":"alex","session_id":"rv-...","files":[...],"instruction":"審查...","is_continuation":false,"memory_enabled":true}
+{"type":"text","delta":"先檢查"}
+{"type":"text","delta":"附件..."}
 {"type":"tool_start","name":"search_knowledge_base","input":{"query":"..."}}
-{"type":"tool_start","name":"write_revised_file","input":{...}}
-{"type":"result","data":{"status":"ok","suggestions":[...],"revised_file_uri":"outputs/x_revised.pdf"}}
+{"type":"tool_start","name":"annotate_file","input":{...}}
+{"type":"result","data":{
+  "status":"ok","session_id":"rv-...","answer":"審查完成...",
+  "outputs":[{"input_uri":"s3://.../cab.pdf","output_uri":"s3://.../cab_revised_xxx.pdf","suggestions":[...]}],
+  "cross_findings":"無跨檔問題"
+}}
 ```
 
 設計取捨：
@@ -223,4 +266,4 @@ agentcore invoke '{"file_uri":"s3://'$S3_BUCKET'/inputs/input_sample.pdf","file_
 - 若 LLM 沒輸出合法 fence，會回 `{"type":"error","message":"failed to parse final \`\`\`json block"}`
 
 ## Out of Scope (PoC)
-未涵蓋：使用者認證 / multi-turn memory / CDK IaC / UI / Guardrails。
+未涵蓋：使用者認證 / CDK IaC / UI / Guardrails / 全新檔案產出（compose report）/ scanned PDF OCR。

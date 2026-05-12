@@ -3,10 +3,10 @@
 Streaming protocol: NDJSON. Each yielded chunk is one JSON object + "\\n".
 Event types: start | text | tool_start | result | error.
 
-Payload (tool-based agent planning, no mode dispatch):
+Payload:
 {
-  "actor_id": "user-123",                                  # required
-  "instruction": "請審查附檔，並對照我之前的 CAB 案件",      # required (natural language)
+  "actor_id": "user-123",                                  # optional (stateless if absent)
+  "instruction": "請審查附檔，並對照我之前的 CAB 案件",      # REQUIRED
   "files": [                                               # optional
     {"uri": "s3://... or local path", "type": "pdf|xlsx"}
   ],
@@ -21,6 +21,7 @@ import re
 import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
@@ -33,9 +34,10 @@ from memory.hooks import DocReviewMemoryHooks
 from memory.preferences import format_preferences_block, load_user_preferences
 from memory.short_term import format_recent_turns_block, load_recent_turns
 from model.load import load_model
-from tools.file_reader import read_input_file as _read
-from tools.file_writer import write_revised_file as _write
+from tools.file_loader import load_file as _load_file
+from tools.file_writer import annotate_file as _annotate
 from tools.kb_search import search_knowledge_base as _kb
+from tools.pdf_inspect import get_pdf_text_positions as _pdf_positions
 from tools.web_search import prewarm_key as _prewarm_tavily_key
 from tools.web_search import web_search as _web
 
@@ -46,65 +48,67 @@ log = app.logger
 logging.basicConfig(level=logging.INFO)
 
 
-MAX_PDF_PAGES = 40
-MAX_XLSX_CELLS_PER_SHEET = 500
-
-# Substituted into the prompt when caller supplies files but no instruction —
-# the file upload itself is treated as an implicit "please review" intent.
-DEFAULT_REVIEW_INSTRUCTION = "請依公司政策審查所有附檔"
-
-
-def _truncate_for_llm(content: dict) -> dict:
-    """Structurally trim oversized content so the LLM gets valid JSON, not a sliced string."""
-    if content.get("type") == "pdf":
-        pages = content.get("pages", [])
-        if len(pages) > MAX_PDF_PAGES:
-            content = {**content, "pages": pages[:MAX_PDF_PAGES],
-                       "truncated": f"showing first {MAX_PDF_PAGES} of {len(pages)} pages"}
-    elif content.get("type") == "xlsx":
-        sheets = []
-        truncated = False
-        for sh in content.get("sheets", []):
-            cells = sh.get("cells", [])
-            if len(cells) > MAX_XLSX_CELLS_PER_SHEET:
-                truncated = True
-                sheets.append({**sh, "cells": cells[:MAX_XLSX_CELLS_PER_SHEET],
-                               "truncated": f"showing first {MAX_XLSX_CELLS_PER_SHEET} of {len(cells)} cells"})
-            else:
-                sheets.append(sh)
-        if truncated:
-            content = {**content, "sheets": sheets}
-    return content
+# Path to the externalized system prompt (XML-tagged sections).
+_PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 
 
 @tool
-def read_input_file(file_uri: str, file_type: str) -> str:
-    """Read a PDF or Excel file and return its structured contents as JSON.
+def load_file(file_uri: str, file_type: str) -> dict:
+    """Load a PDF or Excel file into the conversation so you can see it.
 
-    PDF coordinates use the 'pdf-points-top-left' system (origin top-left, units in
-    PDF points). Each page reports its width/height. When you later call
-    write_revised_file with a bbox, use the same coordinate system.
+    When to call:
+    - The user references a file that was not attached in this turn's payload
+      (typically a uri found in <recent_history> from an earlier turn).
+    - You need to re-examine a previously discussed file at a deeper level.
+
+    Do NOT call this for files already in this turn's payload — those are
+    pre-loaded automatically before you start.
 
     Args:
-        file_uri: Local path or s3:// URI of the input file.
-        file_type: 'pdf' or 'xlsx'.
+        file_uri: An ``s3://bucket/key`` URI or a local filesystem path.
+        file_type: ``"pdf"`` or ``"xlsx"``.
     """
-    return json.dumps(_truncate_for_llm(_read(file_uri, file_type)))
+    return _load_file(file_uri, file_type)
+
+
+@tool
+def get_pdf_text_positions(file_uri: str, page: int) -> str:
+    """Return text blocks + bbox coordinates for a single PDF page.
+
+    When to call:
+    - You need a precise bbox to anchor an annotation, and `anchor_text` alone
+      would be ambiguous (e.g. a checklist where "是" / "否" repeats).
+    - General review usually doesn't need this — prefer `anchor_text` in your
+      suggestion and let `annotate_file` resolve it via text search.
+
+    Args:
+        file_uri: Same URI used with ``load_file`` / the pre-loaded document.
+        page: 1-indexed page number. One page per call.
+
+    Returns: JSON string with a list of `{block_id, bbox, text}` items.
+    Coordinates use `pdf-points-top-left`. Pass a block's `bbox` straight back
+    as the `bbox` field of a suggestion in `annotate_file`.
+    """
+    return _pdf_positions(file_uri, page)
 
 
 @tool
 def search_knowledge_base(query: str) -> str:
     """Retrieve relevant passages from the enterprise Bedrock Knowledge Base.
 
+    Use for company policy, SOP, past case lookups. Prefer this over web_search.
+
     Args:
-        query: A natural-language query about company policy, SOP, or reference material.
+        query: A natural-language query.
     """
     return json.dumps(_kb(query))
 
 
 @tool
 def web_search(query: str) -> str:
-    """Search the public web (Tavily) for up-to-date information not in the KB.
+    """Search the public web (Tavily) for information not in the KB.
+
+    Use only when the knowledge base does not have the information.
 
     Args:
         query: A natural-language web search query.
@@ -113,14 +117,33 @@ def web_search(query: str) -> str:
 
 
 @tool
-def write_revised_file(file_uri: str, file_type: str, suggestions_json: str) -> str:
-    """Write suggestions back into the source file as annotations (PDF) or comments (Excel).
+def annotate_file(file_uri: str, file_type: str, suggestions_json: str) -> str:
+    """Write annotations back into the source file (PDF sticky / Excel comment).
+
+    When to call: the user asked you to review / audit / annotate / leave comments
+    on a file. Do NOT call this for pure summarisation, explanation, or chat.
 
     Args:
-        file_uri: Original file location (same as read_input_file input).
+        file_uri: Original file location (same as the input file uri).
         file_type: 'pdf' or 'xlsx'.
-        suggestions_json: JSON list. PDF items: {finding_id, page, bbox?, text, severity}.
-                          Excel items: {finding_id, sheet, cell, text, severity}.
+        suggestions_json: JSON string decoding to a list of suggestions.
+
+    PDF suggestion fields:
+      finding_id (str), page (int, 1-indexed), severity ("pass"|"info"|"warning"|"critical"),
+      text (str, ≤3 sentences, 繁體中文), AND at least one of:
+        - bbox: [x0,y0,x1,y1]  (most precise; get from get_pdf_text_positions)
+        - anchor_text: str     (≥8 chars, must be unique on the page; include surrounding
+                                identifiers e.g. "R-03 風險評估等級：低")
+        - region: "full_page" | "top_half" | "bottom_half" (for visual elements with no text)
+
+    Excel suggestion fields:
+      finding_id (str), sheet (str), cell (str e.g. "B5"),
+      severity ("pass"|"info"|"warning"|"critical"), text (str, 繁體中文)
+
+    Resolution priority for PDF: bbox > anchor_text > region. If none resolve,
+    the note falls back to the page's top-left corner.
+
+    Returns: URI (local path or s3://...) of the revised file.
     """
     try:
         suggestions = json.loads(suggestions_json)
@@ -128,97 +151,18 @@ def write_revised_file(file_uri: str, file_type: str, suggestions_json: str) -> 
         return f"ERROR: suggestions_json is not valid JSON ({e}). Re-emit the call with a valid JSON array."
     if not isinstance(suggestions, list):
         return "ERROR: suggestions_json must decode to a list. Wrap your suggestions in []."
-    return _write(file_uri, file_type, suggestions)
+    return _annotate(file_uri, file_type, suggestions)
 
 
-SYSTEM_PROMPT = """你是文件審查與顧問助理。所有自然語言輸出（包含註記、建議、推理、回答）**必須使用繁體中文**；JSON keys 維持英文。
+def _load_system_prompt_template() -> str:
+    """Read the XML-tagged system prompt from disk.
 
-## 你的能力
-1. **審查文件** — 當使用者提供 files 時，讀取、分析並把建議寫回檔案。
-2. **一般諮詢** — 回答跟過去審查、政策、法規相關的問題（無需檔案）。
-3. **混合任務** — 同時執行上述兩者（例如：審這份新檔案並對照過去案件）。
+    The file is read once per process (module-level cache below).
+    """
+    return _PROMPT_PATH.read_text(encoding="utf-8")
 
-## 使用者偏好（由系統從過去互動中萃取，請納入審查與回答考量）
-<preferences>
-{PREFERENCES_BLOCK}
-</preferences>
 
-當使用者偏好與本次 instruction 衝突時，以本次 instruction 為主，並在 answer 中簡短說明為何忽略偏好。
-
-## 可用工具
-- `read_input_file(file_uri, file_type)` — 讀取 PDF / Excel 結構化內容
-- `search_knowledge_base(query)` — 查內部政策、SOP、過去案件（優先使用）
-- `web_search(query)` — 查公開網路資訊（KB 沒有時才用）
-- `write_revised_file(file_uri, file_type, suggestions_json)` — 把建議寫回檔案（PDF 加註記、Excel 加留言）
-
-## 決策原則
-- 依照使用者 instruction 判斷意圖，自由組合工具完成任務
-- 若使用者要求審查且有 files：每份檔都要 `read_input_file` → 分析 → 必要時查 KB / web → **務必呼叫 `write_revised_file`** 寫回每份有建議的檔案
-- 若使用者只是提問（無 files）：直接回答；必要時用 `search_knowledge_base` 補充
-- 若有多份檔案，要做跨檔一致性檢查
-- PDF 座標使用 `read_input_file` 回傳的 pdf-points-top-left 系統（原點在左上）
-
-## 接續的 session（重要）
-若 user prompt 開頭含 `<recent_history>` 區塊，那是**這個 session 過去幾輪的對話**：
-- 這通常代表使用者在「對先前審查回饋」或「追問先前話題」
-- 你應該把當前 instruction 視為**接續先前對話**，不是孤立任務
-- 解讀 instruction 中的代稱（finding_id 如 f1/f2、檔名、術語）時，**請從 recent_history 找對應內容**
-- 若使用者是回饋（接受 / 拒絕某些 finding），請：
-  1. 在 answer 中明確覆述使用者的決定（讓他確認你聽懂了）
-  2. 若拒絕理由透露泛用偏好（如「公司內規允許 X」），可在 answer 中總結，後續萃取機制會自動學起來
-  3. 不需要重新呼叫 `read_input_file` / `write_revised_file`，除非使用者明確要求
-- 若 recent_history 不存在，這是 session 第一輪，照原 workflow 進行
-
-## 審查建議格式
-每個 suggestion 必須包含 `finding_id`（你自己編，例如 `f1`, `f2`…，每份檔案內唯一）。
-
-PDF suggestion 欄位：
-- `finding_id`: str
-- `page`: int (1-indexed)
-- `bbox`: [x0, y0, x1, y1]（pdf-points-top-left；不確定時可省略）
-- `text`: str — 註記內文，繁體中文，格式：
-  「【嚴重度】原文摘錄：<原文>\\n建議：<建議內容>\\n依據：<KB 案件名稱或網址>」
-- `severity`: "info" | "warning" | "critical"
-
-Excel suggestion 欄位：
-- `finding_id`, `sheet`, `cell` (e.g. 'A1'), `text`, `severity`（同上）
-
-## 最終回覆格式（強制）
-你的最後一段回覆**必須**以一個 fenced ```json 區塊結尾（後面不可再有任何文字），內容如下：
-
-```json
-{
-  "status": "ok",
-  "session_id": "<從使用者 prompt 取得的 session_id 原樣填回>",
-  "answer": "<繁體中文摘要或直接回答；必填>",
-  "files": [
-    {
-      "input_uri": "<原始 file uri>",
-      "revised_file_uri": "<write_revised_file 回傳的 uri；無建議則同 input_uri>",
-      "suggestions": [ ...該檔的 suggestions array... ]
-    }
-  ],
-  "cross_findings": "<繁體中文段落；無跨檔問題或單檔請填「無跨檔問題」；純諮詢請填「不適用」>"
-}
-```
-
-若是純諮詢任務（沒有處理檔案），`files` 填 `[]`，`cross_findings` 填「不適用」，回答寫在 `answer`。
-
-## 完成審查後的互動引導（重要）
-當你**完成了審查任務**（即呼叫過 `write_revised_file`），`answer` 欄位**結尾**請依該次審查的實際 findings 自然組一段「邀請回饋」的話，目的是引導使用者進入下一輪對話。建議涵蓋以下要素（措辭可自由發揮，不要照抄樣板）：
-
-- 簡單告知審查已完成、寫回檔案的位置
-- 邀請使用者針對你產出的 findings 表示意見（接受、拒絕並附理由、或要求進一步分析某個 finding_id）
-- 提示使用者：回覆時請帶 `session_id={該次 session_id}`，這樣你才能延續對話
-
-純諮詢任務、純回饋接收（已在 recent_history）不需要這段——只在「剛完成新審查」時加。
-
-## 注意事項
-- 不可使用簡體中文或英文撰寫註記內文
-- 沒有依據時請註明「無對應依據」，severity 設為 "info"
-- 註記精簡，每則 ≤ 3 句
-- 不要在最終 ```json 區塊之後再寫任何文字
-"""
+_SYSTEM_PROMPT_TEMPLATE = _load_system_prompt_template()
 
 
 def _build_memory_hooks(actor_id: str | None, session_id: str) -> list:
@@ -244,17 +188,19 @@ def _build_memory_hooks(actor_id: str | None, session_id: str) -> list:
 
 
 def _build_system_prompt(actor_id: str | None) -> str:
-    """Inject the actor's stored USER_PREFERENCE records into the prompt.
+    """Inject the actor's stored USER_PREFERENCE records into the prompt template.
 
-    Returns SYSTEM_PROMPT with the {PREFERENCES_BLOCK} placeholder replaced
-    by either a bullet list of preferences or a placeholder line. Never
-    raises — if memory retrieval fails or no actor_id was provided, prefs
-    is [] and the agent runs as if this user has no prior preferences.
+    Returns the template with the {PREFERENCES_BLOCK} placeholder replaced by
+    either a bullet list of preferences or a placeholder line. Never raises —
+    if memory retrieval fails or no actor_id was provided, prefs is [] and the
+    agent runs as if this user has no prior preferences.
     """
     prefs = load_user_preferences(actor_id) if actor_id else []
     if prefs:
         log.info("injected %d preference(s) for actor=%s", len(prefs), actor_id)
-    return SYSTEM_PROMPT.replace("{PREFERENCES_BLOCK}", format_preferences_block(prefs))
+    return _SYSTEM_PROMPT_TEMPLATE.replace(
+        "{PREFERENCES_BLOCK}", format_preferences_block(prefs)
+    )
 
 
 def build_agent(actor_id: str | None, session_id: str) -> Agent:
@@ -263,7 +209,13 @@ def build_agent(actor_id: str | None, session_id: str) -> Agent:
     return Agent(
         model=load_model(),
         system_prompt=_build_system_prompt(actor_id),
-        tools=[read_input_file, search_knowledge_base, web_search, write_revised_file],
+        tools=[
+            load_file,
+            get_pdf_text_positions,
+            search_knowledge_base,
+            web_search,
+            annotate_file,
+        ],
         hooks=_build_memory_hooks(actor_id, session_id),
     )
 
@@ -302,7 +254,7 @@ def _normalize_files(raw_files: Any) -> tuple[list[dict] | None, str | None]:
 
 
 def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
-    """Strict validation of the new payload shape. No legacy compatibility."""
+    """Strict validation of the payload shape."""
     if not isinstance(payload, dict):
         return None, "payload must be a JSON object"
 
@@ -311,13 +263,11 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
     if legacy_fields:
         return None, (
             f"legacy payload fields not supported: {legacy_fields}. "
-            "use {actor_id, instruction, files?} instead."
+            "use {actor_id?, instruction, files?} instead."
         )
 
     # actor_id is OPTIONAL. Without it the request is processed in stateless
-    # mode (no preference injection, no event write, no history recall) — that
-    # mirrors Phase 1 behaviour so smoke tests / anonymous callers still work
-    # without polluting memory namespaces with a shared "anonymous" identity.
+    # mode (no preference injection, no event write, no history recall).
     actor_id_raw = payload.get("actor_id")
     if actor_id_raw is None:
         actor_id: str | None = None
@@ -330,21 +280,12 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
     if err:
         return None, err
 
-    # instruction is optional ONLY when files are supplied — uploading a file
-    # already implies a review intent, so we substitute a sensible default.
-    # An explicit empty string is still rejected (likely caller bug).
+    # instruction is REQUIRED. Attaching files alone is no longer enough — the
+    # caller must say what they want done (summarise, review, audit, etc.).
     instruction_raw = payload.get("instruction")
-    instruction_was_default = False
-    if instruction_raw is None:
-        if files:
-            instruction = DEFAULT_REVIEW_INSTRUCTION
-            instruction_was_default = True
-        else:
-            return None, "either `instruction` or `files` is required"
-    elif isinstance(instruction_raw, str) and instruction_raw.strip():
-        instruction = instruction_raw.strip()
-    else:
-        return None, "instruction, when provided, must be a non-empty string"
+    if not isinstance(instruction_raw, str) or not instruction_raw.strip():
+        return None, "instruction is required and must be a non-empty string"
+    instruction = instruction_raw.strip()
 
     raw_session = payload.get("session_id")
     is_continuation = isinstance(raw_session, str) and bool(raw_session.strip())
@@ -355,7 +296,6 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
     return {
         "actor_id": actor_id,                    # str or None
         "instruction": instruction,
-        "instruction_was_default": instruction_was_default,
         "files": files or [],
         "session_id": session_id,
         "is_continuation": is_continuation,
@@ -364,12 +304,13 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
 
 
 def _build_prompt(req: dict, history_block: str = "") -> str:
-    """Compose the user-turn prompt from the validated request.
+    """Compose the text portion of the user-turn prompt.
 
-    `history_block`, when non-empty, contains formatted recent turns from
-    the same session (Block C short-term memory). It is injected up-front
-    so the agent treats it as established context, then the new
-    instruction follows as the current turn.
+    Returned as the final ContentBlock after any pre-loaded document blocks.
+    The file uris are spelled out in plain text here so that:
+      (1) the agent can refer to them when calling tools like load_file later
+      (2) memory hooks capture them — first-turn URIs are recoverable from
+          <recent_history> on subsequent turns.
     """
     lines = [
         f"actor_id: {req['actor_id']}",
@@ -392,6 +333,35 @@ def _build_prompt(req: dict, history_block: str = "") -> str:
     lines.append("")
     lines.append(f"完成後請以 fenced ```json 區塊回覆，且 session_id 欄位填 {req['session_id']!r}。")
     return "\n".join(lines)
+
+
+def _build_content_blocks(req: dict, history_block: str) -> list[dict]:
+    """Compose the multimodal user-turn input as a list of Strands ContentBlocks.
+
+    Each file in the payload becomes a `document` content block referenced via
+    its s3 URI (or read into bytes for local paths) — Bedrock fetches s3 sources
+    directly, avoiding a local round-trip. The final block is the text prompt.
+    """
+    blocks: list[dict] = []
+    for f in req["files"]:
+        uri = f["uri"]
+        if uri.startswith("s3://"):
+            source = {"location": {"type": "s3", "uri": uri}}
+            display = os.path.basename(uri)
+        else:
+            path = Path(uri)
+            source = {"bytes": path.read_bytes()}
+            display = path.name
+        stem = display.rsplit(".", 1)[0]
+        blocks.append({
+            "document": {
+                "format": f["type"],
+                "name": stem,
+                "source": source,
+            }
+        })
+    blocks.append({"text": _build_prompt(req, history_block)})
+    return blocks
 
 
 _FENCE_OPEN_RE = re.compile(r"```json\s*", re.IGNORECASE)
@@ -445,7 +415,6 @@ async def invoke(payload, context=None):
         session_id=req["session_id"],
         files=req["files"],
         instruction=req["instruction"],
-        instruction_was_default=req["instruction_was_default"],
         is_continuation=req["is_continuation"],
         memory_enabled=req["memory_enabled"],
     )
@@ -474,7 +443,8 @@ async def invoke(payload, context=None):
 
     try:
         agent = build_agent(req["actor_id"], req["session_id"])
-        async for event in agent.stream_async(_build_prompt(req, history_block)):
+        content_blocks = _build_content_blocks(req, history_block)
+        async for event in agent.stream_async(content_blocks):
             data = event.get("data")
             if isinstance(data, str):
                 final_text_parts.append(data)
