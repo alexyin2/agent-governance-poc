@@ -9,17 +9,33 @@ Strands' @tool decorator passes a dict with `status` + `content` straight throug
 to the model as a tool result, so we can put a {"document": {...}} block here and
 Bedrock's Converse adapter renders it as native multimodal input.
 
-Files via `s3://` URIs are passed as `{"location": {"type": "s3", "uri": ...}}`
-so Bedrock fetches them directly — avoiding a local download round-trip.
+S3 sources are downloaded into bytes here — Bedrock's Converse API does NOT
+accept ``s3Location`` for ``DocumentSource`` on Anthropic Claude models (only
+on Nova). The whole file is inlined as ``{"bytes": ...}`` regardless of origin.
 """
 
 import os
 from pathlib import Path
 from typing import Any
 
+import boto3
+
 
 _PDF_EXTS = (".pdf",)
 _XLSX_EXTS = (".xlsx", ".xlsm", ".xls")
+
+
+def read_uri_bytes(file_uri: str) -> bytes:
+    """Read the full contents of an s3:// URI or local path into memory.
+
+    Shared helper for the loader tool and the runtime's pre-load path so the
+    download logic lives in one place.
+    """
+    if file_uri.startswith("s3://"):
+        bucket, _, key = file_uri[5:].partition("/")
+        obj = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+        return obj["Body"].read()
+    return Path(file_uri).read_bytes()
 
 
 def infer_file_type(file_uri: str) -> str | None:
@@ -63,7 +79,6 @@ def load_file(file_uri: str) -> dict[str, Any]:
         }
 
     if file_uri.startswith("s3://"):
-        source = {"location": {"type": "s3", "uri": file_uri}}
         display_name = os.path.basename(file_uri)
     else:
         path = Path(file_uri)
@@ -72,8 +87,15 @@ def load_file(file_uri: str) -> dict[str, Any]:
                 "status": "error",
                 "content": [{"text": f"file not found: {file_uri}"}],
             }
-        source = {"bytes": path.read_bytes()}
         display_name = path.name
+
+    try:
+        source = {"bytes": read_uri_bytes(file_uri)}
+    except Exception as e:
+        return {
+            "status": "error",
+            "content": [{"text": f"failed to read {file_uri}: {e}"}],
+        }
 
     # Strip extension for the document `name` field — Bedrock disallows dots there.
     stem = display_name.rsplit(".", 1)[0]
