@@ -1,16 +1,55 @@
-"""Write the agent's suggestions back into the source file as annotations / comments."""
+"""Write the agent's suggestions back into the source file as annotations / comments.
 
+Two tools are exposed (one per file kind) so each has a single, focused schema
+the agent must produce — avoids cross-type confusion when one tool tries to
+support both PDF and Excel suggestions.
+
+PDF positioning resolves three modes in priority order:
+
+  1. `bbox`        — exact rectangle (typically obtained via get_pdf_text_positions)
+  2. `anchor_text` — search the page for this text; pick the first match
+  3. `region`      — coarse area on the page ("full_page" / "top_half" / "bottom_half")
+
+If none resolve, the note falls back to a stacked sticky in the page's top-left
+corner so the suggestion still surfaces to the reader.
+
+Defensive text aliasing: the suggestion's body may arrive under any of
+``text`` / ``comment`` / ``body`` / ``content`` / ``note``. Models have a
+tendency to drift toward whichever name fits the domain ("comment" for Excel
+reviews, "content" for general notes), so we accept the common synonyms and
+extract whichever one is non-empty.
+"""
+
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import boto3
 import fitz  # PyMuPDF
 from openpyxl import load_workbook
+from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl.comments import Comment
+from openpyxl.utils import get_column_letter
+
+log = logging.getLogger(__name__)
 
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
+
+
+# Order matters: the agent's canonical key is `text`, but we accept the common
+# synonyms it sometimes drifts to.
+_TEXT_KEYS = ("text", "comment", "body", "content", "note")
+
+
+def _extract_body(s: Dict[str, Any]) -> str:
+    """Pull the suggestion's body from whichever conventional key was used."""
+    for k in _TEXT_KEYS:
+        v = s.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
 
 
 def _timestamp() -> str:
@@ -54,27 +93,81 @@ def _maybe_upload(local: str) -> str:
     return f"s3://{bucket}/{key}"
 
 
-def write_revised_pdf(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
-    """Add a sticky-note annotation per suggestion. Each suggestion needs:
-    {page: int (1-indexed), bbox: [x0,y0,x1,y1] (optional), text: str}
+_REGION_RECTS = {
+    "full_page":   lambda w, h: (20.0, 20.0, w - 20.0, 40.0),
+    "top_half":    lambda w, h: (20.0, 20.0, w - 20.0, h / 2.0),
+    "bottom_half": lambda w, h: (20.0, h / 2.0, w - 20.0, h - 20.0),
+}
+
+
+def _resolve_position(page: fitz.Page, s: Dict[str, Any]) -> Optional[fitz.Rect]:
+    """Resolve a suggestion's position with priority bbox > anchor_text > region.
+
+    Returns None when none of the modes are present or yield a hit; the caller
+    falls back to a corner sticky in that case.
+    """
+    bbox = s.get("bbox")
+    if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        return fitz.Rect(*bbox)
+
+    anchor = s.get("anchor_text")
+    if isinstance(anchor, str) and anchor.strip():
+        hits = page.search_for(anchor)
+        if hits:
+            if len(hits) > 1:
+                log.warning(
+                    "anchor_text matched %d times on page %d (finding_id=%s); using first hit. anchor=%r",
+                    len(hits), page.number + 1, s.get("finding_id", "?"), anchor[:60],
+                )
+            return hits[0]
+
+    region = s.get("region")
+    if isinstance(region, str) and region in _REGION_RECTS:
+        w, h = page.rect.width, page.rect.height
+        return fitz.Rect(*_REGION_RECTS[region](w, h))
+
+    return None
+
+
+def annotate_pdf(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
+    """Annotate a PDF and return the revised file's URI (local or s3://).
+
+    Each suggestion requires:
+      - ``page`` (1-indexed)
+      - one of: ``bbox`` | ``anchor_text`` | ``region``
+      - ``text`` (body of the sticky note; aliases accepted: comment/body/content/note)
+
+    See `_resolve_position` for the resolution order.
     """
     local = _ensure_local(file_uri)
     doc = fitz.open(local)
-    for idx, s in enumerate(suggestions):
-        page_idx = max(0, int(s.get("page", 1)) - 1)
-        if page_idx >= len(doc):
-            continue
-        page = doc[page_idx]
-        bbox = s.get("bbox")
-        body = s.get("text", "")
-        if bbox and len(bbox) == 4:
-            page.add_highlight_annot(fitz.Rect(*bbox))
-            page.add_text_annot(fitz.Point(bbox[0], bbox[1]), body)
-        else:
-            page.add_text_annot(fitz.Point(20, 20 + 15 * idx), body)
-    out = _output_path(local)
-    doc.save(out)
-    doc.close()
+    try:
+        fallback_idx = 0
+        for s in suggestions:
+            page_idx = max(0, int(s.get("page", 1)) - 1)
+            if page_idx >= len(doc):
+                continue
+            page = doc[page_idx]
+            body = _extract_body(s)
+            if not body:
+                log.warning(
+                    "annotate_pdf: empty body for finding_id=%s on page=%s; skipping",
+                    s.get("finding_id", "?"), s.get("page"),
+                )
+                continue
+            rect = _resolve_position(page, s)
+            if rect is not None:
+                page.add_highlight_annot(rect)
+                page.add_text_annot(fitz.Point(rect.x0, rect.y0), body)
+            else:
+                # No location info — stack notes in the page corner so the
+                # suggestion still surfaces (visually clear it lacks anchor).
+                page.add_text_annot(fitz.Point(20, 20 + 15 * fallback_idx), body)
+                fallback_idx += 1
+        out = _output_path(local)
+        doc.save(out)
+    finally:
+        doc.close()
     return _maybe_upload(out)
 
 
@@ -90,27 +183,84 @@ def _comment_size(text: str) -> tuple[int, int]:
     return width, height
 
 
-def write_revised_xlsx(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
-    """Attach a comment per suggestion. Each needs {sheet: str, cell: str (e.g. 'A1'), text: str}."""
+def _resolve_xlsx_anchor(ws, cell_addr: str):
+    """Return the writable cell to attach a comment to.
+
+    openpyxl forbids setting attributes on ``MergedCell`` objects — only the
+    top-left anchor of a merged range is writable. Checklist-style workbooks
+    often have most data cells inside merged ranges (e.g. a 4-column section
+    merged into a single visual cell), so when the agent picks any cell inside
+    such a range we transparently redirect to that range's anchor.
+
+    Returns (target_cell, redirect_note_or_None). The note is a short string
+    we can prepend to the comment so the reader can tell when their pick was
+    redirected, e.g. "(原指定: D7→D5)".
+    """
+    cell = ws[cell_addr]
+    if isinstance(cell, Cell):
+        return cell, None
+    if isinstance(cell, MergedCell):
+        for rng in ws.merged_cells.ranges:
+            if cell.coordinate in rng:
+                anchor = ws.cell(row=rng.min_row, column=rng.min_col)
+                anchor_addr = f"{get_column_letter(rng.min_col)}{rng.min_row}"
+                note = (
+                    None if anchor_addr == cell_addr
+                    else f"(原指定: {cell_addr}→{anchor_addr})"
+                )
+                return anchor, note
+    # Unknown shape (shouldn't happen) — return whatever ws gave us.
+    return cell, None
+
+
+def annotate_xlsx(file_uri: str, suggestions: List[Dict[str, Any]]) -> str:
+    """Attach an Excel cell comment per suggestion.
+
+    Each suggestion requires:
+      - ``sheet`` (worksheet name; defaults to first sheet if absent)
+      - ``cell``  (A1-style address, e.g. ``"B5"``)
+      - ``text``  (body of the comment; aliases accepted: comment/body/content/note)
+
+    If the target cell sits inside a merged range, the comment is attached to
+    the range's top-left anchor (only writable cell) and the original address
+    is preserved in a short prefix on the comment.
+    """
     local = _ensure_local(file_uri)
     wb = load_workbook(local)
     for s in suggestions:
         sheet = s.get("sheet") or wb.sheetnames[0]
-        cell = s.get("cell")
-        body = s.get("text", "")
-        if not cell or sheet not in wb.sheetnames:
+        cell_addr = s.get("cell")
+        body = _extract_body(s)
+        if not cell_addr or sheet not in wb.sheetnames:
+            log.warning(
+                "annotate_xlsx: skipping suggestion finding_id=%s (sheet=%r in_book=%s, cell=%r)",
+                s.get("finding_id", "?"), sheet, sheet in wb.sheetnames, cell_addr,
+            )
             continue
+        if not body:
+            log.warning(
+                "annotate_xlsx: empty body for finding_id=%s at %s!%s; skipping",
+                s.get("finding_id", "?"), sheet, cell_addr,
+            )
+            continue
+        ws = wb[sheet]
+        try:
+            target, redirect_note = _resolve_xlsx_anchor(ws, cell_addr)
+        except Exception as e:
+            log.warning(
+                "annotate_xlsx: cannot resolve %s!%s (%s); skipping finding_id=%s",
+                sheet, cell_addr, e, s.get("finding_id", "?"),
+            )
+            continue
+        if redirect_note:
+            log.info(
+                "annotate_xlsx: redirecting %s!%s -> %s for finding_id=%s (merged cell)",
+                sheet, cell_addr, target.coordinate, s.get("finding_id", "?"),
+            )
+            body = f"{redirect_note}\n{body}"
         comment = Comment(body, "AgentReviewer")
         comment.width, comment.height = _comment_size(body)
-        wb[sheet][cell].comment = comment
+        target.comment = comment
     out = _output_path(local)
     wb.save(out)
     return _maybe_upload(out)
-
-
-def write_revised_file(file_uri: str, file_type: str, suggestions: List[Dict[str, Any]]) -> str:
-    if file_type == "pdf":
-        return write_revised_pdf(file_uri, suggestions)
-    if file_type in ("xlsx", "excel"):
-        return write_revised_xlsx(file_uri, suggestions)
-    raise ValueError(f"Unsupported file_type: {file_type}")
