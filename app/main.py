@@ -36,6 +36,7 @@ from memory.short_term import format_recent_turns_block, load_recent_turns
 from model.load import load_model
 from tools.file_loader import infer_file_type as _infer_type
 from tools.file_loader import load_file as _load_file
+from tools.file_loader import read_uri_bytes as _read_uri_bytes
 from tools.file_writer import annotate_pdf as _annotate_pdf
 from tools.file_writer import annotate_xlsx as _annotate_xlsx
 from tools.kb_search import search_knowledge_base as _kb
@@ -410,26 +411,23 @@ def _build_prompt(req: dict, history_block: str = "") -> str:
 def _build_content_blocks(req: dict, history_block: str) -> list[dict]:
     """Compose the multimodal user-turn input as a list of Strands ContentBlocks.
 
-    Each file in the payload becomes a `document` content block referenced via
-    its s3 URI (or read into bytes for local paths) — Bedrock fetches s3 sources
-    directly, avoiding a local round-trip. The final block is the text prompt.
+    Each file in the payload becomes a `document` content block with the file's
+    bytes inlined. The final block is the text prompt.
+
+    NOTE: Bedrock's Converse API does NOT accept ``s3Location`` as a
+    DocumentSource on Anthropic Claude models — files must be inlined as bytes.
+    We download from s3 here so the rest of the pipeline doesn't need to know.
     """
     blocks: list[dict] = []
     for f in req["files"]:
         uri = f["uri"]
-        if uri.startswith("s3://"):
-            source = {"location": {"type": "s3", "uri": uri}}
-            display = os.path.basename(uri)
-        else:
-            path = Path(uri)
-            source = {"bytes": path.read_bytes()}
-            display = path.name
+        display = os.path.basename(uri) if uri.startswith("s3://") else Path(uri).name
         stem = display.rsplit(".", 1)[0]
         blocks.append({
             "document": {
                 "format": f["type"],
                 "name": stem,
-                "source": source,
+                "source": {"bytes": _read_uri_bytes(uri)},
             }
         })
     blocks.append({"text": _build_prompt(req, history_block)})
