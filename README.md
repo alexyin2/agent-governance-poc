@@ -27,7 +27,7 @@ payload: { instruction (required), files? (PDF/XLSX), actor_id?, session_id? }
 關鍵設計：
 - **Instruction-driven，非線性**：`instruction` 是**必填**且是唯一的行為驅動源。所有工具一次全部 register 給 agent，沒有 if/else 分流；agent 依 instruction 語意自己決定要不要查 KB、要不要寫回、要不要 inspect。同一個入口可處理摘要、政策審查、跨檔比對、純諮詢等情境。
 - **檔案是選填素材**：`files` 可省略（純諮詢、跨輪追問用）；instruction 永遠不能省。舊欄位 `file_uri` / `file_type` / `task` / `mode` 已不支援，會立刻 reject。
-- **多模態預載**：payload 的 `files` 全部 pre-load 為 Bedrock `document` content block，agent 一開始就「看到」整份 PDF/Excel（含圖表、版面）。`s3://` 來源會由 agent 進程下載成 bytes 後 inline（Bedrock Converse 對 Anthropic Claude 不支援 `s3Location` 作為 DocumentSource，只有 Nova 系列支援）。
+- **多模態預載**：payload 的 `files` 全部 pre-load 為 Bedrock `document` content block，agent 一開始就「看到」整份 PDF/Excel（含圖表、版面）。`s3://` URI 直接傳給 Bedrock runtime fetch，不在 agent 本地下載。
 - **PDF 三種定位寫入**：`annotate_pdf` 的 suggestion 接受 `bbox`（最精準）/ `anchor_text`（≥8 字、含上下文識別符）/ `region`（視覺元件），優先序 bbox > anchor_text > region。
 - **PDF / Excel 拆分**：`annotate_pdf` 與 `annotate_xlsx` 是兩個工具，各自只 own 一種 schema，避免跨格式欄位混淆。
 - **內文欄位強制 `text`**：annotate suggestion 的內文 key 必須是 `text`（不是 `comment` / `body` / `content` / `note`），prompt 與 docstring 雙重約束。
@@ -210,7 +210,7 @@ agentcore invoke '{
 # result.outputs[*].output_uri => s3://$S3_BUCKET/outputs/aies_cab1_revised_20260504T044812Z.pdf 等
 ```
 
-> Bedrock Converse 對 Anthropic Claude 不支援 `s3Location` 作為 DocumentSource，所以 agent 進程會用 Runtime execution role 的 `s3:GetObject` 權限把檔案下載成 bytes 後 inline 進 content block。`annotate_pdf` / `annotate_xlsx` 也要把檔案抓回來修改後 PutObject 回 `outputs/`。
+> Bedrock document block 直接吃 `s3://` 來源（透過 Runtime execution role 的 `s3:GetObject` 權限），不在 agent 本地下載。`annotate_pdf` / `annotate_xlsx` 才需要把檔案抓回來修改後 PutObject 回 `outputs/`。
 
 本地開發 `S3_BUCKET` 留空即可 — `tools/file_writer.py` 的 `_maybe_upload` 偵測沒設就只寫 `outputs/` 本地目錄。
 

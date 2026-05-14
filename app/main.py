@@ -56,6 +56,13 @@ logging.basicConfig(level=logging.INFO)
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 
 
+# ── Tool definitions ───────────────────────────────────────────────────────────
+# All seven tools are registered in build_agent(). Their docstrings double as
+# the JSON schema descriptions passed to Claude at runtime; "When to call /
+# Do NOT call" guidance directly shapes the model's tool-selection behaviour.
+# Real implementations live in tools/*.py; these wrappers own only the schema.
+
+
 @tool
 def load_file(file_uri: str) -> dict:
     """Load a PDF or Excel file into the conversation so you can see it.
@@ -143,6 +150,8 @@ def web_search(query: str) -> str:
     return json.dumps(_web(query))
 
 
+# Shared by annotate_pdf and annotate_xlsx. Returns a plain "ERROR: ..." string
+# on failure so the model can self-correct and re-emit without aborting the run.
 def _parse_suggestions(suggestions_json: str) -> tuple[list | None, str | None]:
     try:
         data = json.loads(suggestions_json)
@@ -182,6 +191,7 @@ def annotate_pdf(file_uri: str, suggestions_json: str) -> str:
 
     Returns: URI (local path or s3://...) of the revised PDF.
     """
+    # Validation is extracted to _parse_suggestions so annotate_xlsx can reuse it.
     suggestions, err = _parse_suggestions(suggestions_json)
     if err:
         return err
@@ -215,6 +225,9 @@ def annotate_xlsx(file_uri: str, suggestions_json: str) -> str:
     return _annotate_xlsx(file_uri, suggestions)
 
 
+# ── Agent assembly ─────────────────────────────────────────────────────────────
+
+
 def _load_system_prompt_template() -> str:
     """Read the XML-tagged system prompt from disk.
 
@@ -223,6 +236,7 @@ def _load_system_prompt_template() -> str:
     return _PROMPT_PATH.read_text(encoding="utf-8")
 
 
+# Read once at module import; invoke() replaces {PREFERENCES_BLOCK} at call time.
 _SYSTEM_PROMPT_TEMPLATE = _load_system_prompt_template()
 
 
@@ -240,6 +254,8 @@ def _build_memory_hooks(actor_id: str | None, session_id: str) -> list:
         )
         return []
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-west-2"
+    # DocReviewMemoryHooks registers an AfterInvocationEvent callback that writes
+    # one event per invocation; see memory/hooks.py for the write-path details.
     return [DocReviewMemoryHooks(
         memory_id=memory_id,
         actor_id=actor_id,
@@ -256,6 +272,8 @@ def _build_system_prompt(actor_id: str | None) -> str:
     if memory retrieval fails or no actor_id was provided, prefs is [] and the
     agent runs as if this user has no prior preferences.
     """
+    # Preferences are written by _build_memory_hooks → DocReviewMemoryHooks after
+    # each invocation and read back here on the next invocation for the same actor.
     prefs = load_user_preferences(actor_id) if actor_id else []
     if prefs:
         log.info("injected %d preference(s) for actor=%s", len(prefs), actor_id)
@@ -267,9 +285,12 @@ def _build_system_prompt(actor_id: str | None) -> str:
 def build_agent(actor_id: str | None, session_id: str) -> Agent:
     """Build a fresh Agent per invocation to avoid carrying conversation history
     between unrelated requests."""
+    # A new Agent object is created each time because Strands accumulates
+    # conversation turns inside the Agent instance. Reusing it across invocations
+    # would bleed history across unrelated — or even different-user — requests.
     return Agent(
         model=load_model(),
-        system_prompt=_build_system_prompt(actor_id),
+        system_prompt=_build_system_prompt(actor_id),   # injects per-actor preferences
         tools=[
             load_file,
             inspect_pdf_page,
@@ -279,8 +300,11 @@ def build_agent(actor_id: str | None, session_id: str) -> Agent:
             annotate_pdf,
             annotate_xlsx,
         ],
-        hooks=_build_memory_hooks(actor_id, session_id),
+        hooks=_build_memory_hooks(actor_id, session_id),  # write-back after run
     )
+
+
+# ── Payload helpers ────────────────────────────────────────────────────────────
 
 
 def _ev(type_: str, **fields: Any) -> str:
@@ -292,6 +316,9 @@ def _new_session_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     suffix = uuid.uuid4().hex[:6]
     return f"rv-{ts}-{suffix}"
+
+
+# ── Payload validation ─────────────────────────────────────────────────────────
 
 
 def _normalize_files(raw_files: Any) -> tuple[list[dict] | None, str | None]:
@@ -349,6 +376,7 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
     else:
         return None, "actor_id, when provided, must be a non-empty string"
 
+    # Delegates per-item validation and type inference to _normalize_files.
     files, err = _normalize_files(payload.get("files"))
     if err:
         return None, err
@@ -374,6 +402,9 @@ def _validate_payload(payload: dict) -> tuple[dict | None, str | None]:
         "is_continuation": is_continuation,
         "memory_enabled": actor_id is not None,
     }, None
+
+
+# ── Multimodal input assembly ──────────────────────────────────────────────────
 
 
 def _build_prompt(req: dict, history_block: str = "") -> str:
@@ -427,12 +458,17 @@ def _build_content_blocks(req: dict, history_block: str) -> list[dict]:
             "document": {
                 "format": f["type"],
                 "name": stem,
+                # _read_uri_bytes handles both s3:// and local paths uniformly.
                 "source": {"bytes": _read_uri_bytes(uri)},
             }
         })
+    # Text block always comes last: document blocks first improves prompt-cache
+    # hit rate, and Claude attends more to instructions placed at the end.
     blocks.append({"text": _build_prompt(req, history_block)})
     return blocks
 
+
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
 
 _FENCE_OPEN_RE = re.compile(r"```json\s*", re.IGNORECASE)
 
@@ -449,11 +485,13 @@ def _extract_result(final_text: str) -> dict | None:
         if json_start == -1:
             continue
         try:
+            # raw_decode stops at the end of the JSON object, ignoring trailing
+            # text — handles the case where the model writes prose after the fence.
             obj, _end = decoder.raw_decode(final_text, json_start)
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict):
-            last_obj = obj
+            last_obj = obj  # keep scanning; the *last* fence is the real result
     return last_obj
 
 
@@ -490,6 +528,8 @@ async def invoke(payload, context=None):
     )
 
     # Cold-start prewarm: pull Tavily key from env (local) or AgentCore Identity (cloud).
+    # web_search is a sync tool and cannot await; the key is pre-fetched here so
+    # the tool reads it from a module-level cache at call time.
     try:
         await _prewarm_tavily_key()
     except Exception as e:
@@ -507,8 +547,8 @@ async def invoke(payload, context=None):
             len(recent), req["session_id"],
         )
 
-    seen_tools: set[str] = set()
-    final_text_parts: list[str] = []
+    seen_tools: set[str] = set()   # dedup by toolUseId: Strands emits partial
+    final_text_parts: list[str] = []  # tool_start events while input is streaming
     last_message: dict | None = None
 
     try:
@@ -530,12 +570,15 @@ async def invoke(payload, context=None):
             if event.get("message"):
                 last_message = event["message"]
 
+        # Prefer the structured last_message; fall back to the accumulated stream
+        # chunks in case message is absent (defensive — should not happen normally).
         final_text = _message_text(last_message) or "".join(final_text_parts)
         result = _extract_result(final_text)
         if result is None:
             yield _ev("error", message="failed to parse final ```json block")
             return
-        # Ensure session_id is present in result (agent may forget despite prompt)
+        # Double-safety: the prompt asks the model to echo session_id, but it
+        # occasionally forgets; fill it server-side so the client always has it.
         result.setdefault("session_id", req["session_id"])
         yield _ev("result", data=result)
     except Exception as e:
