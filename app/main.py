@@ -61,6 +61,12 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 # the JSON schema descriptions passed to Claude at runtime; "When to call /
 # Do NOT call" guidance directly shapes the model's tool-selection behaviour.
 # Real implementations live in tools/*.py; these wrappers own only the schema.
+#
+# Where to put what:
+# - per-tool semantics (args / return / when to call THIS tool / when not):
+#   docstrings here, exposed to Claude as the JSON tool schema description.
+# - cross-tool orchestration (priority order, multi-tool workflows, schema
+#   conventions that span tools): app/prompts/system.md <tools> section.
 
 
 @tool
@@ -106,13 +112,15 @@ def inspect_pdf_page(file_uri: str, page: int) -> str:
 
 @tool
 def inspect_xlsx_sheet(file_uri: str, sheet: str | None = None) -> str:
-    """Return a sheet's content (with A1-style column letters) for precise xlsx annotation.
+    """Return a sheet's content with A1-style column letters.
 
     When to call:
-    - Before `annotate_xlsx` on a structured checklist, when you need to know
-      which column letter holds 「評估意見 / 意見 / 備註」 etc.
-    - You want to confirm a sheet's structure before placing comments.
-    - Don't call for ad-hoc edits when you already know exact cell addresses.
+    - You need to know which column letter holds a particular field before
+      placing comments (the column letter is what `annotate_xlsx` cell uses).
+    - Don't call for ad-hoc edits when you already know the exact cell address.
+
+    (For the broader inspect → annotate workflow on structured checklists, see
+    the system prompt's <excel_annotation_guidance>.)
 
     Args:
         file_uri: Same URI used with ``load_file`` / the pre-loaded document.
@@ -121,7 +129,7 @@ def inspect_xlsx_sheet(file_uri: str, sheet: str | None = None) -> str:
     Returns: JSON string of the form
     ``{all_sheets, sheet, dimensions, rows:[{row, cells:[{col, text}]}], truncated}``.
     Empty cells are omitted. You decide which row is the header and which
-    column is the "opinion" column from the content; no server-side guessing.
+    column holds opinions / notes from the content; no server-side guessing.
     """
     return _inspect_xlsx(file_uri, sheet)
 
@@ -177,8 +185,10 @@ def annotate_pdf(file_uri: str, suggestions_json: str) -> str:
       - finding_id: str        unique id within this file (e.g. "f1", "f2")
       - page: int              1-indexed page number
       - severity: str          one of "pass" | "info" | "warning" | "critical"
-      - text: str              ⚠️ KEY MUST BE "text" — body content in 繁體中文, ≤3 sentences.
-                                NOT "comment" / "body" / "content" — use "text" exactly.
+      - text: str              body content in 繁體中文, ≤3 sentences. Canonical key is
+                                `text`; writer also accepts `comment` / `body` / `content` /
+                                `note` as fallback aliases, but prefer `text` for consistency
+                                (logs / replay tools grep on this key).
 
     AND at least one of the following positioning fields:
       - bbox: [x0,y0,x1,y1]    most precise; get from get_pdf_text_positions
@@ -214,8 +224,10 @@ def annotate_xlsx(file_uri: str, suggestions_json: str) -> str:
       - sheet: str             worksheet name (defaults to first sheet if absent)
       - cell: str              A1-style address, e.g. "B5"
       - severity: str          one of "pass" | "info" | "warning" | "critical"
-      - text: str              ⚠️ KEY MUST BE "text" — body content in 繁體中文, ≤3 sentences.
-                                NOT "comment" / "body" / "content" — use "text" exactly.
+      - text: str              body content in 繁體中文, ≤3 sentences. Canonical key is
+                                `text`; writer also accepts `comment` / `body` / `content` /
+                                `note` as fallback aliases, but prefer `text` for consistency
+                                (logs / replay tools grep on this key).
 
     Returns: URI (local path or s3://...) of the revised xlsx.
     """

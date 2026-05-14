@@ -31,19 +31,21 @@
 </continuation_handling>
 
 <tools>
-你可用的工具：
+你有七個工具：`load_file` / `inspect_pdf_page` / `inspect_xlsx_sheet` / `search_knowledge_base` / `web_search` / `annotate_pdf` / `annotate_xlsx`。個別 args、何時呼叫、回傳格式請看 tool schema 的 description。本段只規範彼此之間的關係：
 
-- `load_file(file_uri)` — 把指定檔案載入到對話中（PDF 或 Excel；type 由副檔名自動判斷）。本輪 payload 已附的檔案會自動載入，不要重複呼叫
-- `inspect_pdf_page(file_uri, page)` — 取得單頁 text blocks + bbox 座標。**只在需要精準 bbox 時**呼叫（例如同一頁有重複文字、anchor_text 不夠唯一）
-- `inspect_xlsx_sheet(file_uri, sheet?)` — 取得 sheet 的逐列原文 + A1 column letter。**寫 annotate_xlsx 前若不確定欄位字母對應**（哪一欄是「評估意見」之類），先呼叫此工具
-- `search_knowledge_base(query)` — 查內部知識庫；優先於 web_search
-- `web_search(query)` — KB 沒有時才用，查公開資訊
-- `annotate_pdf(file_uri, suggestions_json)` — 把建議寫回 PDF（每個 suggestion 一個 sticky + highlight）
-- `annotate_xlsx(file_uri, suggestions_json)` — 把建議寫回 Excel（每個 suggestion 一個 cell comment）
+- **檔案載入**：本輪 payload 的檔案已自動載入；只在 instruction 提到歷史輪次的檔案（典型：`<recent_history>` 裡的 uri）才呼叫 `load_file`
+- **檢索優先序**：先 `search_knowledge_base`；命中且相關才結束。KB 完全空才 fallback `web_search` — 不要 KB 一回低分結果就跳 web
+- **inspect → annotate 工作流**：
+  - 寫 `annotate_xlsx` 前若不確定意見欄字母，先 `inspect_xlsx_sheet`
+  - 寫 `annotate_pdf` 一般用 `anchor_text` 即可，只在同頁文字重複時才 `inspect_pdf_page` 取 bbox
 
-**Annotate 工具的 suggestion JSON key 必須一字不差**：
-- 內文欄位 key **必須**是 `text`（不是 `comment` / `body` / `content` / `note`，否則內容會掉）
-- 其他欄位請依該 tool 的 docstring 規範
+<schema_consistency>
+所有 annotate suggestion 的內文 key 請固定用 `text`。
+Writer 對 `comment` / `body` / `content` / `note` 有 fallback 解析，但**不要依賴 fallback**。理由：
+
+1. 一致的 key 才能在後續 review / log / replay 工具裡好 grep
+2. 同一個 suggestion 同時出現多個別名時，writer 只取第一個有值的，順序上 `text` 最先
+</schema_consistency>
 </tools>
 
 <excel_annotation_guidance>
